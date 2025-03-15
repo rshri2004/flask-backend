@@ -10,8 +10,9 @@ from models import (
 import jwt
 import os
 from app import app
+from flask_cors import CORS
 
-
+CORS(app, resources={r"/*": {"origins": "*"}})
 @app.route('/', methods=['GET'])
 def api_home():
     return jsonify({
@@ -35,12 +36,12 @@ def register():
     required_fields = ['first_name', 'last_name', 'email', 'password']
     for field in required_fields:
         if field not in data:
-            return jsonify({'message': f'Missing required field: {field}'}), 400
+            return jsonify({'message': f'Missing required field: {field}', 'success' : False}), 400
 
     # Check if user already exists
     existing_user = Account.query.filter_by(email=data['email']).first()
     if existing_user:
-        return jsonify({'message': 'User with this email already exists'}), 409
+        return jsonify({'message': 'User with this email already exists', 'success' : False}), 409
 
     # Create new user
     new_user = Account(
@@ -53,12 +54,12 @@ def register():
     try:
         new_user.set_password(data['password'])
     except ValueError as e:
-        return jsonify({'message': str(e)}), 400
+        return jsonify({'message': str(e),'success' : False}), 400
 
     db.session.add(new_user)
     db.session.commit()
 
-    return jsonify({'message': 'User registered successfully', 'account_id': new_user.account_id}), 201
+    return jsonify({'message': 'User registered successfully', 'account_id': new_user.account_id, 'success' : True}), 201
 
 
 @app.route('/login', methods=['POST'])
@@ -66,12 +67,12 @@ def login():
     data = request.get_json()
 
     if not data or not data.get('email') or not data.get('password'):
-        return jsonify({'message': 'Email and password are required'}), 400
+        return jsonify({'message': 'Email and password are required', 'success' : False}), 400
 
     user = Account.query.filter_by(email=data['email']).first()
 
     if not user or not user.check_password(data['password']):
-        return jsonify({'message': 'Invalid email or password'}), 401
+        return jsonify({'message': 'Invalid email or password', 'success' : False}), 401
 
     # Log in the user with Flask-Login
     login_user(user)
@@ -89,7 +90,8 @@ def login():
     return jsonify({
         'message': 'Login successful',
         'token': token,
-        'user': user.to_dict()
+        'user': user.to_dict(),
+        'success' : True
     }), 200
 
 
@@ -97,14 +99,14 @@ def login():
 @login_required
 def logout():
     logout_user()
-    return jsonify({'message': 'Logout successful'}), 200
+    return jsonify({'message': 'Logout successful', 'success' : True}), 200
 
 
 # Account Routes
 @app.route('/account', methods=['GET'])
 @login_required
 def get_account():
-    return jsonify(current_user.to_dict()), 200
+    return jsonify({'user':current_user.to_dict(), 'success' : True}), 200
 
 
 @app.route('/account', methods=['PUT'])
@@ -121,19 +123,20 @@ def update_account():
         # Check if email is already in use by another user
         existing_user = Account.query.filter_by(email=data['email']).first()
         if existing_user and existing_user.account_id != current_user.account_id:
-            return jsonify({'message': 'Email already in use'}), 409
+            return jsonify({'message': 'Email already in use', 'success' : False}), 409
         current_user.email = data['email']
     if 'password' in data:
         try:
             current_user.set_password(data['password'])
         except ValueError as e:
-            return jsonify({'message': str(e)}), 400
+            return jsonify({'message': str(e), 'success' : False}), 400
 
     db.session.commit()
 
     return jsonify({
         'message': 'Account updated successfully',
-        'user': current_user.to_dict()
+        'user': current_user.to_dict(),
+        'success': True
     }), 200
 
 
@@ -147,12 +150,12 @@ def create_patient_data():
     required_fields = ['age', 'gender']
     for field in required_fields:
         if field not in data:
-            return jsonify({'message': f'Missing required field: {field}'}), 400
+            return jsonify({'message': f'Missing required field: {field}', 'success' : False}), 400
 
     # Check if personal data already exists for this user
     existing_data = UserPersonalData.query.filter_by(user_account_id=current_user.account_id).first()
     if existing_data:
-        return jsonify({'message': 'Personal data already exists for this user'}), 409
+        return jsonify({'message': 'Personal data already exists for this user', 'success' : False}), 409
 
     # Create new personal data
     new_data = UserPersonalData(
@@ -178,7 +181,8 @@ def create_patient_data():
 
     return jsonify({
         'message': 'Patient data created successfully',
-        'patient': new_data.to_dict()
+        'patient': new_data.to_dict(),
+        'success' : True
     }), 201
 
 
@@ -188,15 +192,15 @@ def get_patient_by_account(account_id):
     """Get patient data by account ID"""
     # Check if user has permission to access this data
     if account_id != current_user.account_id and current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success' : False}), 403
 
     # Find patient data associated with this account
     patient = UserPersonalData.query.filter_by(user_account_id=account_id).first()
 
     if not patient:
-        return jsonify({'message': 'No patient data found for this account'}), 404
+        return jsonify({'message': 'No patient data found for this account', 'success' : False}), 404
 
-    return jsonify(patient.to_dict()), 200
+    return jsonify({'patient':patient.to_dict(), 'success' : True}), 200
 
 @app.route('/patient/<int:patient_id>', methods=['GET'])
 @login_required
@@ -205,9 +209,9 @@ def get_patient_data(patient_id):
     patient = UserPersonalData.query.get_or_404(patient_id)
     print(f"patient.user_account_id :{patient.user_account_id}", f"current_user.account_id :{current_user.account_id}")
     if patient.user_account_id != current_user.account_id and current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success' : False}), 403
 
-    return jsonify(patient.to_dict()), 200
+    return jsonify({'patient': patient.to_dict(), 'success': True}), 200
 
 
 @app.route('/patient/<int:patient_id>', methods=['PUT'])
@@ -217,7 +221,7 @@ def update_patient_data(patient_id):
     patient = UserPersonalData.query.get_or_404(patient_id)
 
     if patient.user_account_id != current_user.account_id and current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     data = request.get_json()
 
@@ -238,7 +242,7 @@ def update_patient_data(patient_id):
             patient.date_of_visit = datetime.strptime(data['date_of_visit'], '%Y-%m-%d').date()
             patient.previous_visits += 1
         except ValueError:
-            return jsonify({'message': 'Invalid date format. Use YYYY-MM-DD'}), 400
+            return jsonify({'message': 'Invalid date format. Use YYYY-MM-DD', 'success': False}), 400
 
     # Recalculate BMI if weight or height changed
     if 'weight_kg' in data or 'height_cm' in data:
@@ -248,7 +252,8 @@ def update_patient_data(patient_id):
 
     return jsonify({
         'message': 'Patient data updated successfully',
-        'patient': patient.to_dict()
+        'patient': patient.to_dict(),
+        'success' : True
     }), 200
 
 
@@ -257,7 +262,7 @@ def update_patient_data(patient_id):
 @login_required
 def get_conditions():
     conditions = Conditions.query.all()
-    return jsonify([condition.to_dict() for condition in conditions]), 200
+    return jsonify({'conditions' : [condition.to_dict() for condition in conditions], 'success': True}), 200
 
 
 @app.route('/conditions', methods=['POST'])
@@ -265,17 +270,17 @@ def get_conditions():
 def create_condition():
     # Only admin can create new conditions
     if current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success' : False}), 403
 
     data = request.get_json()
 
     if not data or 'condition_name' not in data:
-        return jsonify({'message': 'Condition name is required'}), 400
+        return jsonify({'message': 'Condition name is required', 'success' : False}), 400
 
     # Check if condition already exists
     existing_condition = Conditions.query.filter_by(condition_name=data['condition_name']).first()
     if existing_condition:
-        return jsonify({'message': 'Condition already exists'}), 409
+        return jsonify({'message': 'Condition already exists', 'success' : False}), 409
 
     new_condition = Conditions(condition_name=data['condition_name'])
     db.session.add(new_condition)
@@ -283,7 +288,8 @@ def create_condition():
 
     return jsonify({
         'message': 'Condition created successfully',
-        'condition': new_condition.to_dict()
+        'condition': new_condition.to_dict(),
+        'success': True
     }), 201
 
 
@@ -294,25 +300,26 @@ def add_condition_to_patient(patient_id):
 
     # Check if user has permission
     if patient.user_account_id != current_user.account_id and current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success' : False}), 403
 
     data = request.get_json()
 
     if not data or 'condition_id' not in data:
-        return jsonify({'message': 'Condition ID is required'}), 400
+        return jsonify({'message': 'Condition ID is required', 'success' : False}), 400
 
     condition = Conditions.query.get_or_404(data['condition_id'])
 
     # Check if patient already has this condition
     if patient.conditions.filter_by(condition_id=condition.condition_id).first():
-        return jsonify({'message': 'Patient already has this condition'}), 409
+        return jsonify({'message': 'Patient already has this condition', 'success' : False}), 409
 
     patient.conditions.append(condition)
     db.session.commit()
 
     return jsonify({
         'message': 'Condition added to patient successfully',
-        'patient': patient.to_dict()
+        'patient': patient.to_dict(),
+        'success' : True
     }), 200
 
 
@@ -321,7 +328,7 @@ def add_condition_to_patient(patient_id):
 @login_required
 def get_medications():
     medications = Medications.query.all()
-    return jsonify([medication.to_dict() for medication in medications]), 200
+    return jsonify({'medications': [medication.to_dict() for medication in medications], 'success': True}), 200
 
 
 @app.route('/medications', methods=['POST'])
@@ -329,17 +336,17 @@ def get_medications():
 def create_medication():
     # Only admin can create new medications
     if current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     data = request.get_json()
 
     if not data or 'medication_name' not in data:
-        return jsonify({'message': 'Medication name is required'}), 400
+        return jsonify({'message': 'Medication name is required', 'success': False}), 400
 
     # Check if medication already exists
     existing_medication = Medications.query.filter_by(medication_name=data['medication_name']).first()
     if existing_medication:
-        return jsonify({'message': 'Medication already exists'}), 409
+        return jsonify({'message': 'Medication already exists', 'success': False}), 409
 
     new_medication = Medications(medication_name=data['medication_name'])
     db.session.add(new_medication)
@@ -347,7 +354,8 @@ def create_medication():
 
     return jsonify({
         'message': 'Medication created successfully',
-        'medication': new_medication.to_dict()
+        'medication': new_medication.to_dict(),
+        'success': True
     }), 201
 
 
@@ -358,25 +366,26 @@ def add_medication_to_patient(patient_id):
 
     # Check if user has permission
     if patient.user_account_id != current_user.account_id and current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     data = request.get_json()
 
     if not data or 'medication_id' not in data:
-        return jsonify({'message': 'Medication ID is required'}), 400
+        return jsonify({'message': 'Medication ID is required', 'success': False}), 400
 
     medication = Medications.query.get_or_404(data['medication_id'])
 
     # Check if patient already has this medication
     if patient.medications.filter_by(medication_id=medication.medication_id).first():
-        return jsonify({'message': 'Patient already has this medication'}), 409
+        return jsonify({'message': 'Patient already has this medication', 'success': False}), 409
 
     patient.medications.append(medication)
     db.session.commit()
 
     return jsonify({
         'message': 'Medication added to patient successfully',
-        'patient': patient.to_dict()
+        'patient': patient.to_dict(),
+        'success': True
     }), 200
 
 
@@ -389,12 +398,12 @@ def log_device_data():
     required_fields = ['recorded_value', 'element_id', 'user_id']
     for field in required_fields:
         if field not in data:
-            return jsonify({'message': f'Missing required field: {field}'}), 400
+            return jsonify({'message': f'Missing required field: {field}', 'success': False}), 400
 
     # Verify patient exists and user has permission
     patient = UserPersonalData.query.get_or_404(data['user_id'])
     if patient.user_account_id != current_user.account_id and current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     # Verify element exists
     element = InterstitialFluidElement.query.get_or_404(data['element_id'])
@@ -412,7 +421,8 @@ def log_device_data():
 
     return jsonify({
         'message': 'Device data logged successfully',
-        'device_data': new_data.to_dict()
+        'device_data': new_data.to_dict(),
+        'success': True
     }), 201
 
 
@@ -423,7 +433,7 @@ def get_patient_device_data(patient_id):
 
     # Check if user has permission
     if patient.user_account_id != current_user.account_id and current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     # Get query parameters for filtering
     element_id = request.args.get('element_id', type=int)
@@ -441,20 +451,20 @@ def get_patient_device_data(patient_id):
             start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
             query = query.filter(DeviceDataQuery.date_logged >= start_date)
         except ValueError:
-            return jsonify({'message': 'Invalid start_date format. Use YYYY-MM-DD'}), 400
+            return jsonify({'message': 'Invalid start_date format. Use YYYY-MM-DD', 'success': False}), 400
 
     if end_date:
         try:
             end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
             query = query.filter(DeviceDataQuery.date_logged <= end_date)
         except ValueError:
-            return jsonify({'message': 'Invalid end_date format. Use YYYY-MM-DD'}), 400
+            return jsonify({'message': 'Invalid end_date format. Use YYYY-MM-DD', 'success': False}), 400
 
     # Order by date and time
     query = query.order_by(DeviceDataQuery.date_logged, DeviceDataQuery.time_stamp)
 
     device_data = query.all()
-    return jsonify([data.to_dict() for data in device_data]), 200
+    return jsonify({'data': [data.to_dict() for data in device_data], 'success': True}), 200
 
 
 # Reference Data Routes
@@ -462,28 +472,28 @@ def get_patient_device_data(patient_id):
 @login_required
 def get_diet_types():
     diet_types = DietType.query.all()
-    return jsonify([diet.to_dict() for diet in diet_types]), 200
+    return jsonify({'diet_types': [diet.to_dict() for diet in diet_types], 'success': True}), 200
 
 
 @app.route('/activity-levels', methods=['GET'])
 @login_required
 def get_activity_levels():
     activity_levels = PhysicalActivityLevel.query.all()
-    return jsonify([level.to_dict() for level in activity_levels]), 200
+    return jsonify({'activity_levels': [level.to_dict() for level in activity_levels], 'success': True}), 200
 
 
 @app.route('/alcohol-consumption-levels', methods=['GET'])
 @login_required
 def get_alcohol_consumption_levels():
     consumption_levels = AlcoholConsumption.query.all()
-    return jsonify([level.to_dict() for level in consumption_levels]), 200
+    return jsonify({'levels': [level.to_dict() for level in consumption_levels], 'success': True}), 200
 
 
 @app.route('/fluid-elements', methods=['GET'])
 @login_required
 def get_fluid_elements():
     elements = InterstitialFluidElement.query.all()
-    return jsonify([element.to_dict() for element in elements]), 200
+    return jsonify({'elements': [element.to_dict() for element in elements], 'success': True}), 200
 
 
 # Admin-only routes for reference data management
@@ -491,16 +501,16 @@ def get_fluid_elements():
 @login_required
 def create_diet_type():
     if current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     data = request.get_json()
 
     if not data or 'diet_type' not in data:
-        return jsonify({'message': 'Diet type is required'}), 400
+        return jsonify({'message': 'Diet type is required', 'success': False}), 400
 
     existing = DietType.query.filter_by(diet_type=data['diet_type']).first()
     if existing:
-        return jsonify({'message': 'Diet type already exists'}), 409
+        return jsonify({'message': 'Diet type already exists', 'success': False}), 409
 
     new_diet_type = DietType(diet_type=data['diet_type'])
     db.session.add(new_diet_type)
@@ -508,7 +518,8 @@ def create_diet_type():
 
     return jsonify({
         'message': 'Diet type created successfully',
-        'diet_type': new_diet_type.to_dict()
+        'diet_type': new_diet_type.to_dict(),
+        'success': True
     }), 201
 
 
@@ -516,16 +527,16 @@ def create_diet_type():
 @login_required
 def create_activity_level():
     if current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     data = request.get_json()
 
     if not data or 'activity_level' not in data:
-        return jsonify({'message': 'Activity level is required'}), 400
+        return jsonify({'message': 'Activity level is required', 'success': False}), 400
 
     existing = PhysicalActivityLevel.query.filter_by(activity_level=data['activity_level']).first()
     if existing:
-        return jsonify({'message': 'Activity level already exists'}), 409
+        return jsonify({'message': 'Activity level already exists', 'success': False}), 409
 
     new_activity_level = PhysicalActivityLevel(activity_level=data['activity_level'])
     db.session.add(new_activity_level)
@@ -533,7 +544,8 @@ def create_activity_level():
 
     return jsonify({
         'message': 'Activity level created successfully',
-        'activity_level': new_activity_level.to_dict()
+        'activity_level': new_activity_level.to_dict(),
+        'success': True
     }), 201
 
 
@@ -541,16 +553,16 @@ def create_activity_level():
 @login_required
 def create_fluid_element():
     if current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     data = request.get_json()
 
     if not data or 'element_name' not in data:
-        return jsonify({'message': 'Element name is required'}), 400
+        return jsonify({'message': 'Element name is required', 'success': False}), 400
 
     existing = InterstitialFluidElement.query.filter_by(element_name=data['element_name']).first()
     if existing:
-        return jsonify({'message': 'Fluid element already exists'}), 409
+        return jsonify({'message': 'Fluid element already exists', 'success': False}), 409
 
     new_element = InterstitialFluidElement(
         element_name=data['element_name'],
@@ -564,7 +576,8 @@ def create_fluid_element():
 
     return jsonify({
         'message': 'Fluid element created successfully',
-        'element': new_element.to_dict()
+        'element': new_element.to_dict(),
+        'success': True
     }), 201
 
 
@@ -572,16 +585,16 @@ def create_fluid_element():
 @login_required
 def create_alcohol_consumption():
     if current_user.role != 'Admin':
-        return jsonify({'message': 'Unauthorized access'}), 403
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
 
     data = request.get_json()
 
     if not data or 'consumption_level' not in data:
-        return jsonify({'message': 'Consumption level is required'}), 400
+        return jsonify({'message': 'Consumption level is required', 'success': False}), 400
 
     existing = AlcoholConsumption.query.filter_by(consumption_level=data['consumption_level']).first()
     if existing:
-        return jsonify({'message': 'Alcohol consumption level already exists'}), 409
+        return jsonify({'message': 'Alcohol consumption level already exists', 'success': False}), 409
 
     new_level = AlcoholConsumption(consumption_level=data['consumption_level'])
     db.session.add(new_level)
@@ -589,5 +602,6 @@ def create_alcohol_consumption():
 
     return jsonify({
         'message': 'Alcohol consumption level created successfully',
-        'level': new_level.to_dict()
+        'level': new_level.to_dict(),
+        'success': True
     }), 201
