@@ -5,13 +5,18 @@ from datetime import datetime, timedelta
 from models import (
     db, Account, UserPersonalData, Conditions, Medications,
     DietType, PhysicalActivityLevel, AlcoholConsumption,
-    InterstitialFluidElement, DeviceDataQuery
+    InterstitialFluidElement, DeviceDataQuery, ChatManager, Message
 )
 import jwt
 import os
+import json
 from app import app
 from flask_cors import CORS
 from functools import wraps
+import boto3
+import traceback
+from botocore.exceptions import ClientError
+
 
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -732,5 +737,271 @@ def create_alcohol_consumption():
     return jsonify({
         'message': 'Alcohol consumption level created successfully',
         'level': new_level.to_dict(),
+        'success': True
+    }), 201
+
+@app.route('/chat-docs', methods=['POST'])
+def chat_docs():
+    """
+    Chat with a knowledge base (containing multiple PDF documents) using Claude 3.5 Sonnet.
+    The client must send a JSON payload with a "prompt" (the user’s question).
+    The knowledge base is already set up with your documents.
+    """
+    data = request.get_json()
+    if not data or 'prompt' not in data:
+        return jsonify({'message': 'Missing prompt', 'success': False}), 400
+
+    question = data['prompt'].strip()
+    if not question:
+        return jsonify({'message': 'Prompt is empty', 'success': False}), 400
+
+    # Set the region and model details (make sure these match your AWS setup)
+    region = "us-east-1"  # Update if necessary
+    model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
+    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")#"WOGDHCEZX6"  # Your knowledge base ID
+
+    # Create a Boto3 session
+    session = boto3.Session(
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        # If using short-lived credentials, also set:
+        # aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+        region_name=region
+    )
+    # Use the bedrock-agent-runtime client
+    bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
+    model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
+
+    try:
+        response = bedrock_agent_client.retrieve_and_generate(
+            input={'text': question},
+            retrieveAndGenerateConfiguration={
+                'type': 'KNOWLEDGE_BASE',
+                'knowledgeBaseConfiguration': {
+                    'knowledgeBaseId': knowledge_base_id,
+                    'modelArn': model_arn
+                }
+            }
+        )
+        # Attempt to parse Claude's response
+        generated_text = None
+
+        if "output" in response and "text" in response["output"]:
+            generated_text = response["output"]["text"]
+        elif "content" in response and isinstance(response["content"], list):
+            text_blocks = [block["text"] for block in response["content"]
+                           if block.get("type") == "text" and "text" in block]
+            generated_text = "\n".join(text_blocks)
+
+        if not generated_text:
+            return jsonify({
+                'message': 'Unable to parse Claude 3.5 response',
+                'raw_response': response,
+                'success': False
+            }), 200
+
+        return jsonify({
+            'message': 'Doc chat success',
+            'generated_text': generated_text,
+            'success': True
+        }), 200
+
+    except ClientError as e:
+        traceback.print_exc()
+        return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
+
+
+@app.route('/chat-ai/<int:user_id>/<int:chat_id>', methods=['POST'])
+def chat_ai(user_id, chat_id):
+    data = request.get_json()
+    if not data or 'prompt' not in data:
+        return jsonify({'message': 'Missing prompt', 'success': False}), 400
+
+    prompt = data['prompt'].strip()
+    if not prompt:
+        return jsonify({'message': 'Prompt is empty', 'success': False}), 400
+
+    # Check if this chat exists for this user
+    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+    if not chat:
+        # Only create a new chat if it doesn't exist
+        # This allows chat_id=1 to be reused if it exists
+        chat = ChatManager(user_id=user_id, chat_id=chat_id)
+        db.session.add(chat)
+        db.session.commit()
+
+    #
+    if (os.environ.get("AWS_PROFILE") is None):
+        session = boto3.Session(
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            # If short-lived creds:
+            # aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+            region_name='us-east-1'  # or your chosen region
+            # profile_name = "Jeguilos"
+        )
+    else:
+        print("Using profile")
+        session = boto3.Session(
+            profile_name=os.environ.get("AWS_PROFILE")
+        )
+    bedrock_client = session.client('bedrock-runtime')
+
+    # The inference profile ID for Claude 3.7 Sonnet
+    model_id = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+
+    # This matches the example from AWS docs:
+    # "anthropic_version": "bedrock-2023-05-31"
+    # "max_tokens": <some integer>
+    # plus optional fields like "temperature", "top_k", "top_p", "stop_sequences".
+    print(prompt)
+    request_payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 200,
+        "top_k": 250,
+        "temperature": 1,
+        "top_p": 0.999,
+        "stop_sequences": [],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
+
+    try:
+        response = bedrock_client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(request_payload),
+            contentType="application/json",
+            accept="application/json"
+        )
+        response_body = json.loads(response["body"].read())
+
+        # Attempt to parse AI text
+        generated_text = None
+
+        # If the response has "content", join all text segments
+        if "content" in response_body and isinstance(response_body["content"], list):
+            # If there's more than one block, you might join them
+            text_blocks = []
+            for block in response_body["content"]:
+                if block.get("type") == "text" and "text" in block:
+                    text_blocks.append(block["text"])
+            generated_text = "\n".join(text_blocks)  # or " ".join(...)
+
+        # If we still haven't found text, handle that
+        if not generated_text:
+            return jsonify({
+                'message': 'Unable to parse Claude response',
+                'raw_response': response_body,
+                'success': False
+            }), 200
+
+        storeMessage(user_id, chat_id, "user", prompt)
+        storeMessage(user_id, chat_id, "assistant", generated_text)
+
+        return jsonify({
+            'message': 'Claude success',
+            'generated_text': generated_text,
+            'success': True
+        }), 200
+
+    except ClientError as e:
+        return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
+    except Exception as e:
+        return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
+
+
+def storeMessage(user_id, chat_id, sender, content):
+    # Get the actual ChatManager record to get its ID
+    chat_manager = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+
+    if not chat_manager:
+        # This shouldn't happen since you create the chat if it doesn't exist
+        return
+
+    new_message = Message(
+        chat_id=chat_manager.id,  # Use the primary key of ChatManager
+        sender=sender,
+        content=content,
+        timestamp=datetime.utcnow()
+    )
+    db.session.add(new_message)
+    db.session.commit()
+
+
+def createNewChat(user_id, chat_id):
+    new_chat = ChatManager(user_id=user_id, chat_id=chat_id)
+    db.session.add(new_chat)
+    db.session.commit()
+
+
+# GetUserChats test!!
+@app.route('/chats/<int:user_id>', methods=['GET'])
+@token_required
+def get_user_chats(user_id):
+    chats = ChatManager.query.filter_by(user_id=user_id).all()
+
+    return jsonify({
+        'success': True,
+        'chats': [
+            {
+                'id': chat.id,
+                'chat_id': chat.chat_id
+            } for chat in chats
+        ]
+    })
+
+
+# Get Chat History
+@app.route('/chat-history/<int:user_id>/<int:chat_id>', methods=['GET'])
+@token_required
+def get_chat_history(user_id, chat_id):
+    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+
+    if not chat:
+        return jsonify({'message': 'Chat not found', 'success': False}), 404
+
+    messages = Message.query.filter_by(chat_id=chat.id).order_by(Message.timestamp).all()
+
+    return jsonify({
+        'success': True,
+        'messages': [
+            {
+                'id': msg.id,
+                'sender': msg.sender,
+                'content': msg.content,
+                'timestamp': msg.timestamp.strftime('%Y-%m-%dT%H:%M:%S')
+            } for msg in messages
+        ]
+    })
+
+
+@app.route('/chats/<int:user_id>', methods=['POST'])
+@token_required
+def create_new_chat(user_id):
+    # Find the Highest Chat ID for user and increment by 1
+    max_chat = ChatManager.query.filter_by(user_id=user_id).order_by(ChatManager.chat_id.desc()).first()
+    new_chat_id = 1
+    if max_chat:
+        new_chat_id = max_chat.chat_id + 1
+
+    new_chat = ChatManager(user_id=user_id, chat_id=new_chat_id)
+    db.session.add(new_chat)
+    db.session.commit()
+
+    return jsonify({
+        'message': 'Chat created successfully',
+        'chat_id': new_chat_id,
         'success': True
     }), 201

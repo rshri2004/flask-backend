@@ -38,6 +38,7 @@ class Account(db.Model, UserMixin):
     # Relationships
     personal_data = db.relationship('UserPersonalData', back_populates='account', lazy='dynamic',
                                     cascade="all, delete-orphan")
+    chats = db.relationship('ChatManager', back_populates='account', cascade='all, delete-orphan')
 
     def set_password(self, password):
         if len(password) < 8 or len(password) > 16:
@@ -244,3 +245,31 @@ class DeviceDataQuery(db.Model):
             'element_name': self.element.element_name if self.element else None,
             'user_id': self.user_id
         }
+
+
+#Chat, to store the session between the user and AI
+class ChatManager(db.Model):
+    __tablename__ = 'chat_manager'
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    # The user can have any number of chats,
+    # 0 - 3, so we would need a specific chat_id
+    chat_id = db.Column(db.Integer, nullable = False)
+    user_id = db.Column(db.Integer, db.ForeignKey('account.account_id', ondelete='CASCADE'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    messages = db.relationship('Message', back_populates='chat', cascade='all, delete-orphan')
+    account = db.relationship('Account', back_populates='chats')
+
+#Message Table
+class Message(db.Model):
+    __tablename__ = 'messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    chat_id = db.Column(db.Integer, db.ForeignKey('chat_manager.id', ondelete='CASCADE'))
+    sender = db.Column(db.String, nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+    chat = db.relationship('ChatManager', back_populates='messages')  # Fix: Reference ChatManager
