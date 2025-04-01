@@ -129,6 +129,7 @@ def register():
 
 
 @app.route('/login', methods=['POST'])
+
 def login():
     data = request.get_json()
 
@@ -741,40 +742,76 @@ def create_alcohol_consumption():
     }), 201
 
 @app.route('/chat-docs', methods=['POST'])
+@token_required
 def chat_docs():
     """
     Chat with a knowledge base (containing multiple PDF documents) using Claude 3.5 Sonnet.
-    The client must send a JSON payload with a "prompt" (the user’s question).
-    The knowledge base is already set up with your documents.
+    This version also retrieves the user's health profile and injects key insights into the prompt.
+    The client sends a JSON payload with a "prompt" (the user’s question).
     """
     data = request.get_json()
     if not data or 'prompt' not in data:
         return jsonify({'message': 'Missing prompt', 'success': False}), 400
 
-    question = data['prompt'].strip()
-    if not question:
+    user_prompt = data['prompt'].strip()
+    if not user_prompt:
         return jsonify({'message': 'Prompt is empty', 'success': False}), 400
 
-    # Set the region and model details (make sure these match your AWS setup)
+    # Retrieve the current user (using your JWT/session middleware)
+    user = get_current_user()
+    health_context = ""
+    if user:
+        # Retrieve health profile for the user
+        profile = UserPersonalData.query.filter_by(user_account_id=user.account_id).first()
+        if profile:
+            # Build a context string with the key health metrics,
+            # explicitly checking for None so that even falsy numbers are included.
+            health_context = "Profile Info: "
+            if profile.age is not None:
+                health_context += f"Age: {profile.age}. "
+            else:
+                health_context += "Age: unknown. "
+            if profile.weight_kg is not None:
+                health_context += f"Weight: {profile.weight_kg} kg. "
+            else:
+                health_context += "Weight: unknown. "
+            if profile.height_cm is not None:
+                health_context += f"Height: {profile.height_cm} cm. "
+            else:
+                health_context += "Height: unknown. "
+            if profile.blood_pressure:
+                health_context += f"Blood Pressure: {profile.blood_pressure}. "
+            else:
+                health_context += "Blood Pressure: not provided. "
+            if profile.bmi is not None:
+                health_context += f"BMI: {profile.bmi}. "
+            else:
+                health_context += "BMI: unknown. "
+            # End with a newline to separate from the user's question
+            health_context += "\n"
+    
+    # Combine the health context with the user's prompt
+    enhanced_prompt = health_context + user_prompt
+
+    # Set the region, model, and knowledge base details
     region = "us-east-1"  # Update if necessary
     model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
-    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")#"WOGDHCEZX6"  # Your knowledge base ID
+    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
+    if not knowledge_base_id:
+        return jsonify({'message': 'Knowledge base ID not configured', 'success': False}), 500
 
-    # Create a Boto3 session
+    # Create a Boto3 session and use the bedrock-agent-runtime client
     session = boto3.Session(
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        # If using short-lived credentials, also set:
-        # aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
         region_name=region
     )
-    # Use the bedrock-agent-runtime client
     bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
     model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
 
     try:
         response = bedrock_agent_client.retrieve_and_generate(
-            input={'text': question},
+            input={'text': enhanced_prompt},
             retrieveAndGenerateConfiguration={
                 'type': 'KNOWLEDGE_BASE',
                 'knowledgeBaseConfiguration': {
@@ -785,7 +822,6 @@ def chat_docs():
         )
         # Attempt to parse Claude's response
         generated_text = None
-
         if "output" in response and "text" in response["output"]:
             generated_text = response["output"]["text"]
         elif "content" in response and isinstance(response["content"], list):
