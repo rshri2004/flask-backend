@@ -258,6 +258,7 @@ class ChatManager(db.Model):
     chat_id = db.Column(db.Integer, nullable = False)
     user_id = db.Column(db.Integer, db.ForeignKey('account.account_id', ondelete='CASCADE'))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    title = db.Column(db.String(255))  # New field for chat title
 
     messages = db.relationship('Message', back_populates='chat', cascade='all, delete-orphan')
     account = db.relationship('Account', back_populates='chats')

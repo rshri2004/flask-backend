@@ -740,19 +740,68 @@ def create_alcohol_consumption():
         'success': True
     }), 201
 
-@app.route('/chat-docs', methods=['POST'])
-def chat_docs():
-    """
-    Chat with a knowledge base (containing multiple PDF documents) using Claude 3.5 Sonnet.
-    The client must send a JSON payload with a "prompt" (the user’s question).
-    The knowledge base is already set up with your documents.
-    """
+def generate_title_with_claude(first_message):
+    """Generate a descriptive title for a chat using Claude itself"""
+    try:
+        # Set up the AWS session exactly as we do for regular Claude calls
+        if (os.environ.get("AWS_PROFILE") is None):
+            session = boto3.Session(
+                aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+                region_name='us-east-1'
+            )
+        else:
+            print("Using profile")
+            session = boto3.Session(
+                profile_name=os.environ.get("AWS_PROFILE")
+            )
+            
+        bedrock_runtime = session.client(service_name='bedrock-runtime')
+        
+        # Special prompt to ask Claude to generate a short, descriptive title
+        title_prompt = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 20,  # Short response
+            "temperature": 0.7,
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": f"Based on this first message in a conversation, generate a very concise, descriptive title (5 words maximum, no quotes): \"{first_message}\""
+                }
+            ]
+        }
+        
+        # Call Claude via Bedrock for title generation
+        response = bedrock_runtime.invoke_model(
+            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+            body=json.dumps(title_prompt)
+        )
+        
+        # Parse the response
+        response_body = json.loads(response['body'].read().decode())
+        
+        if "content" in response_body and len(response_body["content"]) > 0:
+            title = response_body["content"][0]["text"].strip()
+            
+            # Clean up the title (remove quotes if present)
+            if title.startswith('"') and title.endswith('"'):
+                title = title[1:-1]
+                
+            return title
+        
+        return "New Chat"  # Fallback
+    except Exception as e:
+        print(f"Error generating title: {e}")
+        return "New Chat"  # Fallback
+
+@app.route('/chat-ai/<int:user_id>/<int:chat_id>', methods=['POST'])
+def chat_ai(user_id, chat_id):
     data = request.get_json()
     if not data or 'prompt' not in data:
         return jsonify({'message': 'Missing prompt', 'success': False}), 400
 
-    question = data['prompt'].strip()
-    if not question:
+    prompt = data['prompt'].strip()
+    if not prompt:
         return jsonify({'message': 'Prompt is empty', 'success': False}), 400
 
     # Set the region and model details (make sure these match your AWS setup)
@@ -760,21 +809,44 @@ def chat_docs():
     model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
     knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")#"WOGDHCEZX6"  # Your knowledge base ID
 
-    # Create a Boto3 session
-    session = boto3.Session(
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        # If using short-lived credentials, also set:
-        # aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
-        region_name=region
-    )
-    # Use the bedrock-agent-runtime client
+    # Check if this chat exists for this user
+    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+    
+    # Track if this is the first message (for title generation)
+    first_message = False
+    
+    if not chat:
+        # Create new chat if it doesn't exist
+        chat = ChatManager(user_id=user_id, chat_id=chat_id, title="New Chat")
+        db.session.add(chat)
+        db.session.commit()
+        first_message = True
+    else:
+        # Check if there are any messages in this chat
+        first_message = not Message.query.filter_by(chat_id=chat.id).first()
+
+    #
+    if (os.environ.get("AWS_PROFILE") is None):
+        session = boto3.Session(
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            # If short-lived creds:
+            # aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+            region_name='us-east-1'  # or your chosen region
+            # profile_name = "Jeguilos"
+        )
+    else:
+        print("Using profile")
+        session = boto3.Session(
+            profile_name=os.environ.get("AWS_PROFILE")
+        )
+   # Use the bedrock-agent-runtime client
     bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
     model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
 
     try:
         response = bedrock_agent_client.retrieve_and_generate(
-            input={'text': question},
+            input={'text': prompt},  # Using prompt variable
             retrieveAndGenerateConfiguration={
                 'type': 'KNOWLEDGE_BASE',
                 'knowledgeBaseConfiguration': {
@@ -800,119 +872,19 @@ def chat_docs():
                 'success': False
             }), 200
 
-        return jsonify({
-            'message': 'Doc chat success',
-            'generated_text': generated_text,
-            'success': True
-        }), 200
-
-    except ClientError as e:
-        traceback.print_exc()
-        return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
-
-
-@app.route('/chat-ai/<int:user_id>/<int:chat_id>', methods=['POST'])
-def chat_ai(user_id, chat_id):
-    data = request.get_json()
-    if not data or 'prompt' not in data:
-        return jsonify({'message': 'Missing prompt', 'success': False}), 400
-
-    prompt = data['prompt'].strip()
-    if not prompt:
-        return jsonify({'message': 'Prompt is empty', 'success': False}), 400
-
-    # Check if this chat exists for this user
-    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
-    if not chat:
-        # Only create a new chat if it doesn't exist
-        # This allows chat_id=1 to be reused if it exists
-        chat = ChatManager(user_id=user_id, chat_id=chat_id)
-        db.session.add(chat)
-        db.session.commit()
-
-    #
-    if (os.environ.get("AWS_PROFILE") is None):
-        session = boto3.Session(
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            # If short-lived creds:
-            # aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
-            region_name='us-east-1'  # or your chosen region
-            # profile_name = "Jeguilos"
-        )
-    else:
-        print("Using profile")
-        session = boto3.Session(
-            profile_name=os.environ.get("AWS_PROFILE")
-        )
-    bedrock_client = session.client('bedrock-runtime')
-
-    # The inference profile ID for Claude 3.7 Sonnet
-    model_id = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
-
-    # This matches the example from AWS docs:
-    # "anthropic_version": "bedrock-2023-05-31"
-    # "max_tokens": <some integer>
-    # plus optional fields like "temperature", "top_k", "top_p", "stop_sequences".
-    print(prompt)
-    request_payload = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 200,
-        "top_k": 250,
-        "temperature": 1,
-        "top_p": 0.999,
-        "stop_sequences": [],
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    }
-
-    try:
-        response = bedrock_client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(request_payload),
-            contentType="application/json",
-            accept="application/json"
-        )
-        response_body = json.loads(response["body"].read())
-
-        # Attempt to parse AI text
-        generated_text = None
-
-        # If the response has "content", join all text segments
-        if "content" in response_body and isinstance(response_body["content"], list):
-            # If there's more than one block, you might join them
-            text_blocks = []
-            for block in response_body["content"]:
-                if block.get("type") == "text" and "text" in block:
-                    text_blocks.append(block["text"])
-            generated_text = "\n".join(text_blocks)  # or " ".join(...)
-
-        # If we still haven't found text, handle that
-        if not generated_text:
-            return jsonify({
-                'message': 'Unable to parse Claude response',
-                'raw_response': response_body,
-                'success': False
-            }), 200
-
         storeMessage(user_id, chat_id, "user", prompt)
         storeMessage(user_id, chat_id, "assistant", generated_text)
+        
+        # Generate a title if this is the first message
+        if first_message:
+            title = generate_title_with_claude(prompt)
+            chat.title = title
+            db.session.commit()
 
         return jsonify({
             'message': 'Claude success',
             'generated_text': generated_text,
+            'title': chat.title,
             'success': True
         }), 200
 
@@ -957,7 +929,8 @@ def get_user_chats(user_id):
         'chats': [
             {
                 'id': chat.id,
-                'chat_id': chat.chat_id
+                'chat_id': chat.chat_id,
+                'title': chat.title or f"Chat #{chat.chat_id}"
             } for chat in chats
         ]
     })
@@ -976,6 +949,7 @@ def get_chat_history(user_id, chat_id):
 
     return jsonify({
         'success': True,
+        'title': chat.title,
         'messages': [
             {
                 'id': msg.id,
@@ -996,12 +970,13 @@ def create_new_chat(user_id):
     if max_chat:
         new_chat_id = max_chat.chat_id + 1
 
-    new_chat = ChatManager(user_id=user_id, chat_id=new_chat_id)
+    new_chat = ChatManager(user_id=user_id, chat_id=new_chat_id, title=f"New Chat #{new_chat_id}")
     db.session.add(new_chat)
     db.session.commit()
 
     return jsonify({
         'message': 'Chat created successfully',
         'chat_id': new_chat_id,
+        'title': new_chat.title,
         'success': True
     }), 201
