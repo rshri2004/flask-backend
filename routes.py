@@ -749,7 +749,7 @@ def generate_title_with_claude(first_message):
                 aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
                 aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
                 # If short-lived creds:
-                aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
+                #aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
                 region_name='us-east-1'
             )
         else:
@@ -806,17 +806,17 @@ def chat_ai(user_id, chat_id):
     if not prompt:
         return jsonify({'message': 'Prompt is empty', 'success': False}), 400
 
-    # Set the region and model details (make sure these match your AWS setup)
-    region = "us-east-1"  # Update if necessary
+    # Set the region and model details
+    region = "us-east-1"
     model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
-    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")#"WOGDHCEZX6"  # Your knowledge base ID
+    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
 
     # Check if this chat exists for this user
     chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
-    
+
     # Track if this is the first message (for title generation)
     first_message = False
-    
+
     if not chat:
         # Create new chat if it doesn't exist
         chat = ChatManager(user_id=user_id, chat_id=chat_id, title="New Chat")
@@ -827,28 +827,51 @@ def chat_ai(user_id, chat_id):
         # Check if there are any messages in this chat
         first_message = not Message.query.filter_by(chat_id=chat.id).first()
 
-    #
+    # Get previous messages from this chat
+    previous_messages = Message.query.filter_by(chat_id=chat.id).order_by(Message.timestamp).all()
+
+    # context-aware prompt by adding previous conversations
+    enhanced_prompt = prompt
+
+    # Only include history if there are previous messages
+    if previous_messages and len(previous_messages) > 0:
+        # Limit to last 5 exchanges to avoid token limits(for user and assistant)
+        history_text = []
+        recent_messages = previous_messages[-10:]  # Get last 10 messages
+
+        for msg in recent_messages:
+            role = "User" if msg.sender == "user" else "Assistant"
+            history_text.append(f"{role}: {msg.content}")
+
+        # Construct enhanced prompt with history context
+        if history_text:
+            history_string = "\n".join(history_text)
+            enhanced_prompt = f"""
+                Previous conversation:{history_string}
+                New question: {prompt}
+                Please respond to the new question in the context of the previous conversation.
+                """
+
     if (os.environ.get("AWS_PROFILE") is None):
         session = boto3.Session(
             aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            # If short-lived creds:
-            aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
-            region_name='us-east-1'  # or your chosen region
-            # profile_name = "Jeguilos"
+            region_name='us-east-1'
         )
     else:
         print("Using profile")
         session = boto3.Session(
             profile_name=os.environ.get("AWS_PROFILE")
         )
-   # Use the bedrock-agent-runtime client
+
+    # Use the bedrock-agent-runtime client
     bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
     model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
 
     try:
+        # Use the enhanced prompt that includes conversation history
         response = bedrock_agent_client.retrieve_and_generate(
-            input={'text': prompt},  # Using prompt variable
+            input={'text': enhanced_prompt},
             retrieveAndGenerateConfiguration={
                 'type': 'KNOWLEDGE_BASE',
                 'knowledgeBaseConfiguration': {
@@ -857,6 +880,7 @@ def chat_ai(user_id, chat_id):
                 }
             }
         )
+
         # Attempt to parse Claude's response
         generated_text = None
 
@@ -876,7 +900,7 @@ def chat_ai(user_id, chat_id):
 
         storeMessage(user_id, chat_id, "user", prompt)
         storeMessage(user_id, chat_id, "assistant", generated_text)
-        
+
         # Generate a title if this is the first message
         if first_message:
             title = generate_title_with_claude(prompt)
@@ -894,8 +918,6 @@ def chat_ai(user_id, chat_id):
         return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
     except Exception as e:
         return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
-
-
 def storeMessage(user_id, chat_id, sender, content):
     # Get the actual ChatManager record to get its ID
     chat_manager = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
