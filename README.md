@@ -1,5 +1,14 @@
 # flask-backend
 
+## setting up a virtual environment
+(Tested on Mac)
+- python3 -m venv [folder name]
+- source [folder name]/bin/activate
+
+To Deactivate Venv:
+- 'deactivate'
+
+
 ## Set up
 
 - git clone git@github.com:rshri2004/flask-backend.git
