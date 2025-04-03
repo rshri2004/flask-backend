@@ -1006,3 +1006,20 @@ def create_new_chat(user_id):
         'title': new_chat.title,
         'success': True
     }), 201
+
+
+@app.route('/chats/<int:user_id>/<int:chat_id>', methods=['DELETE'])
+@token_required
+def delete_chat(user_id, chat_id):
+    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+
+    if not chat:
+        print("Chat not found")
+        return jsonify({'message': 'Chat not found', 'success': False}), 404
+
+    #delete all messages associated with this chat
+    #Message.query.filter_by(chat_id=chat.id).delete()
+    db.session.delete(chat)
+    db.session.commit()
+
+    return jsonify({'message': 'Chat deleted successfully', 'success': True}), 200
