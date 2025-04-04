@@ -797,19 +797,69 @@ def generate_title_with_claude(first_message):
         return "New Chat"  # Fallback
 
 @app.route('/chat-ai/<int:user_id>/<int:chat_id>', methods=['POST'])
+@token_required
 def chat_ai(user_id, chat_id):
     data = request.get_json()
     if not data or 'prompt' not in data:
         return jsonify({'message': 'Missing prompt', 'success': False}), 400
 
+    #prompt to user_prompt
     prompt = data['prompt'].strip()
     if not prompt:
         return jsonify({'message': 'Prompt is empty', 'success': False}), 400
+
+    ##This is where we get the user data into the chatbot
+    #Retrieve current user using JWT token
+    user = get_current_user()
+    health_context = ""
+
+    if user:
+    # Retrieve health profile for the user
+        profile = UserPersonalData.query.filter_by(user_account_id=user.account_id).first()
+
+        if profile:
+            # Build a context string with the key health metrics,
+            # explicitly checking for None so that even falsy numbers are included.
+            health_context = "Profile Info: "
+
+            if profile.age is not None:
+                health_context += f"Age: {profile.age}. "
+            else:
+                health_context += "Age: unknown. "
+
+            if profile.weight_kg is not None:
+                health_context += f"Weight: {profile.weight_kg} kg. "
+            else:
+                health_context += "Weight: unknown. "
+
+            if profile.height_cm is not None:
+                health_context += f"Height: {profile.height_cm} cm. "
+            else:
+                health_context += "Height: unknown. "
+
+            if profile.blood_pressure:
+                health_context += f"Blood Pressure: {profile.blood_pressure}. "
+            else:
+                health_context += "Blood Pressure: not provided. "
+
+            if profile.bmi is not None:
+                health_context += f"BMI: {profile.bmi}. "
+            else:
+                health_context += "BMI: unknown. "
+
+            # End with a newline to separate from the user's question
+            health_context += "\n"
+
+    # Combine the health context with the user's prompt
+    profile_prompt = health_context + prompt
 
     # Set the region and model details
     region = "us-east-1"
     model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
     knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
+
+    if not knowledge_base_id:
+        return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
 
     # Check if this chat exists for this user
     chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
@@ -831,7 +881,7 @@ def chat_ai(user_id, chat_id):
     previous_messages = Message.query.filter_by(chat_id=chat.id).order_by(Message.timestamp).all()
 
     # context-aware prompt by adding previous conversations
-    enhanced_prompt = prompt
+    enhanced_prompt = profile_prompt
 
     # Only include history if there are previous messages
     if previous_messages and len(previous_messages) > 0:
@@ -848,7 +898,7 @@ def chat_ai(user_id, chat_id):
             history_string = "\n".join(history_text)
             enhanced_prompt = f"""
                 Previous conversation:{history_string}
-                New question: {prompt}
+                New question: {profile_prompt}
                 Please respond to the new question in the context of the previous conversation.
                 """
 
@@ -920,6 +970,7 @@ def chat_ai(user_id, chat_id):
         return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
     except Exception as e:
         return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
+    
 def storeMessage(user_id, chat_id, sender, content):
     # Get the actual ChatManager record to get its ID
     chat_manager = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
