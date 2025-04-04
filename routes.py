@@ -1074,3 +1074,38 @@ def delete_chat(user_id, chat_id):
     db.session.commit()
 
     return jsonify({'message': 'Chat deleted successfully', 'success': True}), 200
+
+# Update chat title
+@app.route('/chats/<int:user_id>/<int:chat_id>/title', methods=['PUT'])
+@token_required
+def update_chat_title(user_id, chat_id):
+    user = get_current_user()
+    if not user:
+        return jsonify({'message': 'Authentication required', 'success': False}), 401
+
+    # Get chat
+    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+    if not chat:
+        return jsonify({'message': 'Chat not found', 'success': False}), 404
+
+    # Verify chat owner
+    if chat.user_id != user.account_id:
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
+
+    # Get new title
+    data = request.get_json()
+    if not data or 'title' not in data:
+        return jsonify({'message': 'Title is required', 'success': False}), 400
+
+    chat.title = data['title']
+    db.session.commit()
+
+    return jsonify({
+        'message': 'Chat title updated successfully',
+        'chat': {
+            'id': chat.id,
+            'chat_id': chat.chat_id,
+            'title': chat.title
+        },
+        'success': True
+    }), 200
