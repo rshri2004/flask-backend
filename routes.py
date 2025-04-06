@@ -795,19 +795,267 @@ def generate_title_with_claude(first_message):
     except Exception as e:
         print(f"Error generating title: {e}")
         return "New Chat"  # Fallback
+@app.route('/chat-ai-context/<int:user_id>/<int:chat_id>', methods=['POST'])
+@token_required
+def chat_ai_with_context(user_id, chat_id):
+    data = request.get_json()
+    
+    if not data or 'prompt' not in data or 'context' not in data:
+        return jsonify({'message': 'Missing prompt or context', 'success': False}), 400
+    
+    user_prompt = data['prompt'].strip()
+    biomarker_context = data['context']
+    
+    if not user_prompt:
+        return jsonify({'message': 'Prompt is empty', 'success': False}), 400
+    
+    # Check if this chat exists for this user
+    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+    first_message = False
+    
+    if not chat:
+        # Create new chat if it doesn't exist
+        chat = ChatManager(user_id=user_id, chat_id=chat_id, title="Biomarker Analysis")
+        db.session.add(chat)
+        db.session.commit()
+        first_message = True
+    else:
+        # Check if there are any messages in this chat
+        first_message = not Message.query.filter_by(chat_id=chat.id).first()
+    
+    # Retrieve current user using JWT token
+    user = get_current_user()
+    health_context = ""
+    
+    if user:
+        # Retrieve health profile for the user
+        profile = UserPersonalData.query.filter_by(user_account_id=user.account_id).first()
+        
+        if profile:
+            # Build context with health metrics (your existing code)
+            health_context = "Profile Info: "
+            if profile.age is not None:
+                health_context += f"Age: {profile.age}. "
+            # ... rest of your health context code ...
+    
+    # Parse the biomarker context JSON
+    try:
+        biomarker_data = json.loads(biomarker_context)
+        
+        # Build a specialized prompt with the biomarker data
+        enhanced_prompt = f"""
+You are analyzing biomarker data for a patient. Here is the detailed information:
 
+BIOMARKER: {biomarker_data.get('elementName', 'Unknown')}
+DATE RANGE: {biomarker_data.get('dateRange', 'Unknown')}
+TIME FRAME: {biomarker_data.get('timeFrame', 'Unknown')}
+TOTAL MEASUREMENTS: {biomarker_data.get('totalMeasurements', 'Unknown')}
+"""
+
+        # Add normal range if available
+        if biomarker_data.get('normalRange'):
+            nr = biomarker_data['normalRange']
+            enhanced_prompt += f"""
+NORMAL RANGE:
+- Lower limit: {nr.get('lower', 'Not specified')}
+- Upper limit: {nr.get('upper', 'Not specified')}
+- Lower critical: {nr.get('lowerCritical', 'Not specified')}
+- Upper critical: {nr.get('upperCritical', 'Not specified')}
+"""
+
+        # Add statistics if available
+        if biomarker_data.get('statistics'):
+            stats = biomarker_data['statistics']
+            enhanced_prompt += f"""
+STATISTICS:
+- Average: {stats.get('average', 'Unknown')}
+- Minimum: {stats.get('minimum', {}).get('value', 'Unknown')} on {stats.get('minimum', {}).get('date', 'Unknown')}
+- Maximum: {stats.get('maximum', {}).get('value', 'Unknown')} on {stats.get('maximum', {}).get('date', 'Unknown')}
+"""
+
+        # Add raw data points if available
+        if biomarker_data.get('rawData'):
+            enhanced_prompt += "\nRAW DATA POINTS:\n"
+            for i, point in enumerate(biomarker_data['rawData']):
+                enhanced_prompt += f"- {point.get('date', 'Unknown')}: {point.get('value', 'Unknown')}\n"
+                
+            if biomarker_data.get('truncated'):
+                enhanced_prompt += f"\n(Showing {len(biomarker_data['rawData'])} of {biomarker_data.get('totalPoints', 'multiple')} data points)\n"
+
+        # Add the user's question
+        enhanced_prompt += f"\nThe patient is asking: \"{user_prompt}\"\n"
+        enhanced_prompt += """
+Please analyze this biomarker data comprehensively. Cover the following aspects:
+1. Summarize the key findings and trends
+2. Evaluate if values are within normal ranges
+3. Explain what this biomarker indicates about health
+4. Suggest follow-up questions the patient could ask
+5. Provide any relevant health recommendations based on these values
+
+Answer directly to the patient's question while incorporating this analysis.
+"""
+
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"Error parsing biomarker context: {e}")
+        # Use a simpler fallback prompt
+        enhanced_prompt = f"""
+Analyzing patient biomarker data.
+
+Profile info: {health_context}
+
+The patient is asking: "{user_prompt}"
+
+Please provide an analysis of the biomarker data.
+"""
+    
+    # Get previous messages from this chat
+    previous_messages = Message.query.filter_by(chat_id=chat.id).order_by(Message.timestamp).all()
+    
+    # Add conversation history to the prompt if there are previous messages
+    if previous_messages and len(previous_messages) > 0:
+        history_text = []
+        recent_messages = previous_messages[-10:]  # Get last 10 messages
+        
+        for msg in recent_messages:
+            role = "User" if msg.sender == "user" else "Assistant"
+            history_text.append(f"{role}: {msg.content}")
+        
+        if history_text:
+            history_string = "\n".join(history_text)
+            enhanced_prompt = f"""
+Previous conversation:
+{history_string}
+
+{enhanced_prompt}
+"""
+    
+    # Set up AWS Bedrock
+    if (os.environ.get("AWS_PROFILE") is None):
+        session = boto3.Session(
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            region_name='us-east-1'
+        )
+    else:
+        print("Using profile")
+        session = boto3.Session(
+            profile_name=os.environ.get("AWS_PROFILE")
+        )
+    
+    # Use the bedrock-agent-runtime client
+    bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
+    model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
+    region = "us-east-1"
+    model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
+    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
+    
+    if not knowledge_base_id:
+        return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
+    
+    try:
+        # Use the enhanced prompt that includes biomarker context
+        response = bedrock_agent_client.retrieve_and_generate(
+            input={'text': enhanced_prompt},
+            retrieveAndGenerateConfiguration={
+                'type': 'KNOWLEDGE_BASE',
+                'knowledgeBaseConfiguration': {
+                    'knowledgeBaseId': knowledge_base_id,
+                    'modelArn': model_arn
+                }
+            }
+        )
+        
+        # Parse Claude's response (same as your existing code)
+        generated_text = None
+        
+        if "output" in response and "text" in response["output"]:
+            generated_text = response["output"]["text"]
+        elif "content" in response and isinstance(response["content"], list):
+            text_blocks = [block["text"] for block in response["content"]
+                          if block.get("type") == "text" and "text" in block]
+            generated_text = "\n".join(text_blocks)
+        
+        if not generated_text:
+            return jsonify({
+                'message': 'Unable to parse Claude 3.5 response',
+                'raw_response': response,
+                'success': False
+            }), 200
+        
+        # Store messages
+        storeMessage(user_id, chat_id, "user", user_prompt)
+        storeMessage(user_id, chat_id, "assistant", generated_text)
+        
+        # Generate a title if this is the first message
+        if first_message:
+            title = generate_title_with_claude(user_prompt)
+            chat.title = title
+            db.session.commit()
+        
+        return jsonify({
+            'message': 'Claude success',
+            'generated_text': generated_text,
+            'title': chat.title,
+            'success': True
+        }), 200
+        
+    except ClientError as e:
+        return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
+    
 @app.route('/chat-ai/<int:user_id>/<int:chat_id>', methods=['POST'])
 @token_required
 def chat_ai(user_id, chat_id):
     data = request.get_json()
-    if not data or 'prompt' not in data:
-        return jsonify({'message': 'Missing prompt', 'success': False}), 400
-
-    #prompt to user_prompt
-    prompt = data['prompt'].strip()
-    if not prompt:
-        return jsonify({'message': 'Prompt is empty', 'success': False}), 400
-
+    
+    # Handle system message (biomarker data)
+    if 'system_message' in data:
+        system_message = data['system_message'].strip()
+        if not system_message:
+            return jsonify({'message': 'System message is empty', 'success': False}), 400
+            
+        # Check if this chat exists for this user
+        chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+        
+        # If no chat exists, create a new one
+        if not chat:
+            # Find the highest chat ID for user and increment by 1
+            max_chat = ChatManager.query.filter_by(user_id=user_id).order_by(ChatManager.chat_id.desc()).first()
+            new_chat_id = 1
+            if max_chat:
+                new_chat_id = max_chat.chat_id + 1
+                
+            suggested_title = data.get('suggested_title', 'Biomarker Analysis')
+            chat = ChatManager(user_id=user_id, chat_id=new_chat_id, title=suggested_title)
+            db.session.add(chat)
+            db.session.commit()
+            
+            # Update chat_id to the new one
+            chat_id = new_chat_id
+        
+        # Store the system message as an assistant message
+        storeMessage(user_id, chat_id, "assistant", system_message)
+        
+        # If save_only flag is true, don't generate a Claude response
+        if data.get('save_only', False):
+            return jsonify({
+                'success': True,
+                'message': 'System message stored',
+                'title': chat.title,
+                'chat_id': chat_id
+            })
+    
+    # Handle normal user prompt if system_message is not present
+    elif 'prompt' not in data:
+        return jsonify({'message': 'Missing prompt or system_message', 'success': False}), 400
+    
+    # Process normal user prompt (existing code)
+    if 'prompt' in data:
+        prompt = data['prompt'].strip()
+        if not prompt:
+            return jsonify({'message': 'Prompt is empty', 'success': False}), 400
     ##This is where we get the user data into the chatbot
     #Retrieve current user using JWT token
     user = get_current_user()
