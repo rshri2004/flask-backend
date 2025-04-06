@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from models import (
     db, Account, UserPersonalData, Conditions, Medications,
     DietType, PhysicalActivityLevel, AlcoholConsumption,
-    InterstitialFluidElement, DeviceDataQuery, ChatManager, Message
+    InterstitialFluidElement, DeviceDataQuery, ChatManager, Message, NotificationCache
 )
 import jwt
 import os
@@ -16,6 +16,8 @@ from functools import wraps
 import boto3
 import traceback
 from botocore.exceptions import ClientError
+import re
+import hashlib
 
 
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -1109,3 +1111,360 @@ def update_chat_title(user_id, chat_id):
         },
         'success': True
     }), 200
+
+
+# Helper function to generate cache key based on user data and biomarker readings
+def generate_cache_key(user_id, profile_data=None, latest_reading_timestamp=None):
+    #Generate a unique cache key based on user ID and latest data changes
+    key_parts = [str(user_id)]
+
+    # Add profile data last updated timestamp if available
+    if profile_data and hasattr(profile_data, 'date_of_visit'):
+        key_parts.append(str(profile_data.date_of_visit))
+
+    # Add latest biomarker reading timestamp if available
+    if latest_reading_timestamp:
+        key_parts.append(str(latest_reading_timestamp))
+
+    # Add day component to expire cache each day at minimum
+    key_parts.append(datetime.now().strftime('%Y-%m-%d'))
+
+    # Create a unique hash from the combined values
+    cache_key = hashlib.md5(":".join(key_parts).encode()).hexdigest()
+    return cache_key
+
+
+@app.route('/health-notifications/<int:user_id>', methods=['GET'])
+@token_required
+def get_health_notifications(user_id):
+    """
+    Generate health notifications based on user profile and biomarker data.
+
+    Uses a database-backed caching layer to improve performance:
+    - Cache invalidation based on data changes and time thresholds
+    - Force refresh option via query parameter
+    """
+    # Get current user from token
+    current_user = get_current_user()
+
+    # Check if user has permission to access this data
+    if user_id != current_user.account_id and current_user.role != 'Admin':
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
+
+    # Check for force refresh parameter
+    force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+
+    try:
+        # 1. Fetch user profile data
+        profile = UserPersonalData.query.filter_by(user_account_id=user_id).first()
+        if not profile:
+            return jsonify({'message': 'User profile not found', 'success': False}), 404
+
+        # 2. Get timestamp of latest biomarker reading
+        latest_reading = DeviceDataQuery.query.filter_by(user_id=profile.patient_id).order_by(
+            DeviceDataQuery.date_logged.desc(),
+            DeviceDataQuery.time_stamp.desc()
+        ).first()
+
+        latest_timestamp = None
+        if latest_reading:
+            latest_timestamp = f"{latest_reading.date_logged} {latest_reading.time_stamp}"
+
+        # 3. Generate cache key
+        cache_key = generate_cache_key(user_id, profile, latest_timestamp)
+
+        # 4. Try to get from cache first (unless force refresh is requested)
+        if not force_refresh:
+            # Try database cache
+            db_cache = NotificationCache.query.filter_by(cache_key=cache_key).first()
+            if db_cache and db_cache.is_valid():
+                # Valid cache entry found in database
+                notifications = json.loads(db_cache.notifications_json)
+
+                return jsonify({
+                    'message': 'Health notifications retrieved from cache',
+                    'notifications': notifications,
+                    'cached': True,
+                    'cache_updated': db_cache.last_updated.strftime('%Y-%m-%d %H:%M:%S'),
+                    'success': True
+                }), 200
+
+        # 5. No valid cache found or force refresh generate fresh notifications
+
+        # Fetch user conditions and medications
+        conditions = [condition.condition_name for condition in profile.conditions]
+        medications = [medication.medication_name for medication in profile.medications]
+
+        # Fetch biomarker data for different time frames
+        today = datetime.now().date()
+        time_frames = {
+            "today": (today, today),
+            "past_week": (today - timedelta(days=7), today),
+            "past_month": (today - timedelta(days=30), today),
+            "past_three_months": (today - timedelta(days=90), today),
+            "past_six_months": (today - timedelta(days=180), today),
+            "past_year": (today - timedelta(days=365), today)
+        }
+
+        # Get all biomarker elements
+        elements = InterstitialFluidElement.query.all()
+        element_map = {element.element_id: element.element_name for element in elements}
+
+        # Initialize biomarker data structure
+        biomarker_data = {}
+
+        # Get device data for each time frame
+        for period_name, (start_date, end_date) in time_frames.items():
+            # Query data for this time frame
+            query = DeviceDataQuery.query.filter_by(user_id=profile.patient_id).filter(
+                DeviceDataQuery.date_logged >= start_date,
+                DeviceDataQuery.date_logged <= end_date
+            ).order_by(DeviceDataQuery.date_logged, DeviceDataQuery.time_stamp)
+
+            device_data = query.all()
+
+            # Process data into a structured format
+            if device_data:
+                biomarker_data[period_name] = {}
+                for data_point in device_data:
+                    element_name = element_map.get(data_point.element_id)
+                    if element_name not in biomarker_data[period_name]:
+                        biomarker_data[period_name][element_name] = []
+
+                    # Add data point with date and value
+                    biomarker_data[period_name][element_name].append({
+                        "date": data_point.date_logged.strftime('%Y-%m-%d'),
+                        "time": data_point.time_stamp.strftime('%H:%M:%S'),
+                        "value": data_point.recorded_value
+                    })
+
+        # Calculate statistics for each biomarker and time frame
+        biomarker_stats = {}
+        for period_name, period_data in biomarker_data.items():
+            biomarker_stats[period_name] = {}
+            for element_name, readings in period_data.items():
+                # Only calculate stats if we have readings
+                if readings:
+                    values = [reading["value"] for reading in readings]
+                    biomarker_stats[period_name][element_name] = {
+                        "count": len(values),
+                        "min": min(values),
+                        "max": max(values),
+                        "avg": sum(values) / len(values),
+                        "first": values[0],
+                        "last": values[-1],
+                        # Calculate trend (positive = increasing, negative = decreasing)
+                        "trend": values[-1] - values[0] if len(values) > 1 else 0
+                    }
+
+        # Get reference ranges for each biomarker
+        element_reference_ranges = {}
+        for element in elements:
+            element_reference_ranges[element.element_name] = {
+                "lower_limit": float(element.lower_limit) if element.lower_limit else None,
+                "upper_limit": float(element.upper_limit) if element.upper_limit else None,
+                "lower_critical_limit": float(element.lower_critical_limit) if element.lower_critical_limit else None,
+                "upper_critical_limit": float(element.upper_critical_limit) if element.upper_critical_limit else None
+            }
+
+        # Build the context for the AWS RAG query
+        health_context = {
+            "profile": {
+                "age": profile.age,
+                "gender": profile.gender,
+                "bmi": float(profile.bmi) if profile.bmi else None,
+                "weight_kg": profile.weight_kg,
+                "height_cm": profile.height_cm,
+                "blood_pressure": profile.blood_pressure,
+                "conditions": conditions,
+                "medications": medications,
+                "is_smoker": profile.is_smoker,
+                "diet_type_id": profile.diet_type_id,
+                "physical_activity_level_id": profile.physical_activity_level_id,
+                "alcohol_consumption_id": profile.alcohol_consumption_id
+            },
+            "biomarker_stats": biomarker_stats,
+            "reference_ranges": element_reference_ranges
+        }
+
+        # Convert to JSON string
+        health_context_json = json.dumps(health_context, indent=2)
+
+        # Create the prompt for Claude
+        prompt = f"""
+        Based on the following patient health data, generate a list of ACTIONABLE health notifications that should be shown to the patient in their home feed.
+
+        Patient health data:
+        {health_context_json}
+
+        For each notification:
+        1. Focus on significant findings, concerning trends, or positive improvements
+        2. Prioritize notifications (Critical, Warning, Informational, Positive)
+        3. Make suggestions specific and actionable
+        4. Reference specific biomarkers and their values/trends
+        5. Put the information in context of the patient's conditions and risk factors
+        6. Explain in simple terms why this notification matters to their health
+        7. Use a supportive, non-alarming tone even for critical notifications
+        8. Specify which time range was used for the recommendation (today, past_week, past_month, past_three_months, past_six_months, past_year)
+
+        Return the results in the following JSON format:
+        {{
+          "notifications": [
+            {{
+              "id": 1,
+              "priority": "Critical|Warning|Informational|Positive",
+              "title": "Brief clear description",
+              "message": "Detailed explanation and recommendation",
+              "related_biomarkers": ["biomarker1", "biomarker2"],
+              "time_range": "time period used for this insight (today, past_week, past_month, etc.)",
+              "recommendation": "Specific action the user should take"
+            }}
+          ]
+        }}
+
+        Return at most 5 notifications, prioritizing the most significant findings.
+        """
+
+        # Setup AWS session
+        if (os.environ.get("AWS_PROFILE") is None):
+            session = boto3.Session(
+                aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+                region_name='us-east-1'
+            )
+        else:
+            session = boto3.Session(
+                profile_name=os.environ.get("AWS_PROFILE")
+            )
+
+        # Use the bedrock-agent-runtime client
+        bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
+
+        # Get the knowledge base ID from environment
+        knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
+        if not knowledge_base_id:
+            return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
+
+        # Set the model details
+        region = "us-east-1"
+        model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
+        model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
+
+        # Call AWS Bedrock RAG
+        response = bedrock_agent_client.retrieve_and_generate(
+            input={'text': prompt},
+            retrieveAndGenerateConfiguration={
+                'type': 'KNOWLEDGE_BASE',
+                'knowledgeBaseConfiguration': {
+                    'knowledgeBaseId': knowledge_base_id,
+                    'modelArn': model_arn
+                }
+            }
+        )
+
+        # Parse the response
+        generated_text = None
+        if "output" in response and "text" in response["output"]:
+            generated_text = response["output"]["text"]
+        elif "content" in response and isinstance(response["content"], list):
+            text_blocks = [block["text"] for block in response["content"]
+                           if block.get("type") == "text" and "text" in block]
+            generated_text = "\n".join(text_blocks)
+
+        if not generated_text:
+            return jsonify({
+                'message': 'Unable to parse Claude response',
+                'success': False
+            }), 500
+
+        # Extract JSON from the response
+        try:
+            # Extract JSON part from the response
+            json_match = re.search(r'```json\s*(.*?)\s*```', generated_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # If no JSON code block, try to find JSON object directly
+                json_match = re.search(r'({[\s\S]*})', generated_text)
+                json_str = json_match.group(1) if json_match else generated_text
+
+            notifications_data = json.loads(json_str)
+            notifications = notifications_data.get('notifications', [])
+
+            # 6. Store in database cache
+            # Calculate expiration time (24 hours later)
+            invalidate_time = datetime.utcnow() + timedelta(hours=24)
+
+            # Check if we have an existing cache entry
+            existing_cache = NotificationCache.query.filter_by(cache_key=cache_key).first()
+
+            if existing_cache:
+                # Update existing cache entry
+                existing_cache.notifications_json = json.dumps(notifications)
+                existing_cache.last_updated = datetime.utcnow()
+                existing_cache.invalidate_after = invalidate_time
+            else:
+                # Create new cache entry
+                new_cache = NotificationCache(
+                    user_id=user_id,
+                    cache_key=cache_key,
+                    notifications_json=json.dumps(notifications),
+                    invalidate_after=invalidate_time
+                )
+                db.session.add(new_cache)
+
+            db.session.commit()
+
+            # Return the parsed notifications
+            return jsonify({
+                'message': 'Health notifications generated successfully',
+                'notifications': notifications,
+                'cached': False,
+                'success': True
+            }), 200
+
+        except (json.JSONDecodeError, AttributeError) as e:
+            # If JSON parsing fails, return the raw text
+            return jsonify({
+                'message': 'Failed to parse notifications as JSON',
+                'generated_text': generated_text,
+                'error': str(e),
+                'success': False
+            }), 200
+
+    except ClientError as e:
+        return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
+    except Exception as e:
+        print(f"Error generating health notifications: {traceback.format_exc()}")
+        return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
+
+
+# Utility endpoint to manually invalidate the notification cache
+@app.route('/health-notifications/<int:user_id>/invalidate-cache', methods=['POST'])
+@token_required
+def invalidate_notification_cache(user_id):
+    """Manually invalidate the cached notifications for a user"""
+    current_user = get_current_user()
+
+    # Check permissions
+    if user_id != current_user.account_id and current_user.role != 'Admin':
+        return jsonify({'message': 'Unauthorized access', 'success': False}), 403
+
+    try:
+        # Find all cache entries for this user
+        cache_entries = NotificationCache.query.filter_by(user_id=user_id).all()
+
+        # Delete all entries
+        for entry in cache_entries:
+            db.session.delete(entry)
+
+        db.session.commit()
+
+        return jsonify({
+            'message': f'Cache invalidated for user {user_id}',
+            'entries_removed': len(cache_entries),
+            'success': True
+        }), 200
+
+    except Exception as e:
+        return jsonify({'message': f'Error invalidating cache: {str(e)}', 'success': False}), 500

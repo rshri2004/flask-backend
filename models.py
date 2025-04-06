@@ -274,3 +274,34 @@ class Message(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
     chat = db.relationship('ChatManager', back_populates='messages')  # Fix: Reference ChatManager
+
+
+class NotificationCache(db.Model):
+    """
+    Database model for caching health notifications to improve API performance.
+    """
+    __tablename__ = 'notification_cache'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('account.account_id', ondelete='CASCADE'))
+    cache_key = db.Column(db.String(128), unique=True, nullable=False, index=True)
+    notifications_json = db.Column(db.Text, nullable=False)
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+    invalidate_after = db.Column(db.DateTime)
+
+    # Relationship
+    account = db.relationship('Account')
+
+    def is_valid(self):
+        """Check if the cache entry is still valid based on expiration time"""
+        return self.invalidate_after is None or self.invalidate_after > datetime.utcnow()
+
+    def to_dict(self):
+        """Convert cache entry to dictionary"""
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'cache_key': self.cache_key,
+            'last_updated': self.last_updated.strftime('%Y-%m-%d %H:%M:%S'),
+            'invalidate_after': self.invalidate_after.strftime('%Y-%m-%d %H:%M:%S') if self.invalidate_after else None
+        }
