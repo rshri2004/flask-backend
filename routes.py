@@ -1143,6 +1143,7 @@ def get_health_notifications(user_id):
     Uses a database-backed caching layer to improve performance:
     - Cache invalidation based on data changes and time thresholds
     - Force refresh option via query parameter
+    - Optimized to make a single API call for all biomarker data
     """
     # Get current user from token
     current_user = get_current_user()
@@ -1155,47 +1156,47 @@ def get_health_notifications(user_id):
     force_refresh = request.args.get('refresh', 'false').lower() == 'true'
 
     try:
-        # 1. Fetch user profile data
-        profile = UserPersonalData.query.filter_by(user_account_id=user_id).first()
-        if not profile:
-            return jsonify({'message': 'User profile not found', 'success': False}), 404
-
-        # 2. Get timestamp of latest biomarker reading
-        latest_reading = DeviceDataQuery.query.filter_by(user_id=profile.patient_id).order_by(
-            DeviceDataQuery.date_logged.desc(),
-            DeviceDataQuery.time_stamp.desc()
-        ).first()
-
-        latest_timestamp = None
-        if latest_reading:
-            latest_timestamp = f"{latest_reading.date_logged} {latest_reading.time_stamp}"
-
-        # 3. Generate cache key
-        cache_key = generate_cache_key(user_id, profile, latest_timestamp)
-
-        # 4. Try to get from cache first (unless force refresh is requested)
+        # First, clean up any old cache entries for this user
         if not force_refresh:
-            # Try database cache
-            db_cache = NotificationCache.query.filter_by(cache_key=cache_key).first()
-            if db_cache and db_cache.is_valid():
+            stale_entries = NotificationCache.query.filter(
+                NotificationCache.user_id == user_id,
+                NotificationCache.invalidate_after < datetime.utcnow()
+            ).all()
+
+            for entry in stale_entries:
+                db.session.delete(entry)
+
+            db.session.commit()
+
+            # Now check for any valid cache entry for this user
+            valid_cache = NotificationCache.query.filter(
+                NotificationCache.user_id == user_id,
+                NotificationCache.invalidate_after >= datetime.utcnow()
+            ).first()
+
+            if valid_cache:
                 # Valid cache entry found in database
-                notifications = json.loads(db_cache.notifications_json)
+                notifications = json.loads(valid_cache.notifications_json)
 
                 return jsonify({
                     'message': 'Health notifications retrieved from cache',
                     'notifications': notifications,
                     'cached': True,
-                    'cache_updated': db_cache.last_updated.strftime('%Y-%m-%d %H:%M:%S'),
+                    'cache_updated': valid_cache.last_updated.strftime('%Y-%m-%d %H:%M:%S'),
                     'success': True
                 }), 200
 
-        # 5. No valid cache found or force refresh generate fresh notifications
+        # If we reach here, there's no valid cache or force refresh was requested
+        # 1. Fetch user profile data
+        profile = UserPersonalData.query.filter_by(user_account_id=user_id).first()
+        if not profile:
+            return jsonify({'message': 'User profile not found', 'success': False}), 404
 
-        # Fetch user conditions and medications
+        # 2. Fetch user conditions and medications
         conditions = [condition.condition_name for condition in profile.conditions]
         medications = [medication.medication_name for medication in profile.medications]
 
-        # Fetch biomarker data for different time frames
+        # 3. Define time periods for analysis
         today = datetime.now().date()
         time_frames = {
             "today": (today, today),
@@ -1206,39 +1207,52 @@ def get_health_notifications(user_id):
             "past_year": (today - timedelta(days=365), today)
         }
 
-        # Get all biomarker elements
+        # Get earliest date needed (1 year ago) for a single query
+        earliest_date = today - timedelta(days=365)
+
+        # 4. Get all biomarker elements
         elements = InterstitialFluidElement.query.all()
         element_map = {element.element_id: element.element_name for element in elements}
 
-        # Initialize biomarker data structure
+        # 5. Make a SINGLE API call to fetch ALL device data for the past year
+        all_device_data = DeviceDataQuery.query.filter_by(user_id=profile.patient_id).filter(
+            DeviceDataQuery.date_logged >= earliest_date
+        ).order_by(DeviceDataQuery.date_logged, DeviceDataQuery.time_stamp).all()
+
+        # 6. Process the data into time frames after fetching it once
         biomarker_data = {}
 
-        # Get device data for each time frame
-        for period_name, (start_date, end_date) in time_frames.items():
-            # Query data for this time frame
-            query = DeviceDataQuery.query.filter_by(user_id=profile.patient_id).filter(
-                DeviceDataQuery.date_logged >= start_date,
-                DeviceDataQuery.date_logged <= end_date
-            ).order_by(DeviceDataQuery.date_logged, DeviceDataQuery.time_stamp)
+        # Initialize all time frames and biomarkers with empty lists
+        for period_name in time_frames.keys():
+            biomarker_data[period_name] = {}
+            for element_id, element_name in element_map.items():
+                biomarker_data[period_name][element_name] = []
 
-            device_data = query.all()
 
-            # Process data into a structured format
-            if device_data:
-                biomarker_data[period_name] = {}
-                for data_point in device_data:
-                    element_name = element_map.get(data_point.element_id)
+        # Populate data for each time frame from the single dataset
+        for data_point in all_device_data:
+            data_date = data_point.date_logged
+            element_name = element_map.get(data_point.element_id)
+
+            if not element_name:
+                continue  # Skip if element not found in map
+
+            # Create a data point object
+            point_data = {
+                "date": data_date.strftime('%Y-%m-%d'),
+                "time": data_point.time_stamp.strftime('%H:%M:%S'),
+                "value": data_point.recorded_value
+            }
+
+            # Add to all applicable time frames
+            for period_name, (start_date, end_date) in time_frames.items():
+                if start_date <= data_date <= end_date:
                     if element_name not in biomarker_data[period_name]:
                         biomarker_data[period_name][element_name] = []
 
-                    # Add data point with date and value
-                    biomarker_data[period_name][element_name].append({
-                        "date": data_point.date_logged.strftime('%Y-%m-%d'),
-                        "time": data_point.time_stamp.strftime('%H:%M:%S'),
-                        "value": data_point.recorded_value
-                    })
+                    biomarker_data[period_name][element_name].append(point_data)
 
-        # Calculate statistics for each biomarker and time frame
+        # 7. Calculate statistics for each biomarker and time frame
         biomarker_stats = {}
         for period_name, period_data in biomarker_data.items():
             biomarker_stats[period_name] = {}
@@ -1251,13 +1265,13 @@ def get_health_notifications(user_id):
                         "min": min(values),
                         "max": max(values),
                         "avg": sum(values) / len(values),
-                        "first": values[0],
-                        "last": values[-1],
+                        "first": values[0] if values else None,
+                        "last": values[-1] if values else None,
                         # Calculate trend (positive = increasing, negative = decreasing)
                         "trend": values[-1] - values[0] if len(values) > 1 else 0
                     }
 
-        # Get reference ranges for each biomarker
+        # 8. Get reference ranges for each biomarker
         element_reference_ranges = {}
         for element in elements:
             element_reference_ranges[element.element_name] = {
@@ -1267,7 +1281,7 @@ def get_health_notifications(user_id):
                 "upper_critical_limit": float(element.upper_critical_limit) if element.upper_critical_limit else None
             }
 
-        # Build the context for the AWS RAG query
+        # 9. Build the context for the AWS RAG query
         health_context = {
             "profile": {
                 "age": profile.age,
@@ -1289,8 +1303,9 @@ def get_health_notifications(user_id):
 
         # Convert to JSON string
         health_context_json = json.dumps(health_context, indent=2)
+        print(biomarker_stats)
 
-        # Create the prompt for Claude
+        # 10. Create the prompt for Claude
         prompt = f"""
         Based on the following patient health data, generate a list of ACTIONABLE health notifications that should be shown to the patient in their home feed.
 
@@ -1325,7 +1340,7 @@ def get_health_notifications(user_id):
         Return at most 5 notifications, prioritizing the most significant findings.
         """
 
-        # Setup AWS session
+        # 11. Setup AWS session
         if (os.environ.get("AWS_PROFILE") is None):
             session = boto3.Session(
                 aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
@@ -1350,7 +1365,7 @@ def get_health_notifications(user_id):
         model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
         model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
 
-        # Call AWS Bedrock RAG
+        # 12. Call AWS Bedrock RAG
         response = bedrock_agent_client.retrieve_and_generate(
             input={'text': prompt},
             retrieveAndGenerateConfiguration={
@@ -1362,7 +1377,7 @@ def get_health_notifications(user_id):
             }
         )
 
-        # Parse the response
+        # 13. Parse the response
         generated_text = None
         if "output" in response and "text" in response["output"]:
             generated_text = response["output"]["text"]
@@ -1377,9 +1392,10 @@ def get_health_notifications(user_id):
                 'success': False
             }), 500
 
-        # Extract JSON from the response
+        # 14. Extract JSON from the response
         try:
-            # Extract JSON part from the response
+            # Extract JSON part from the response (it might contain markdown or explanations)
+            import re
             json_match = re.search(r'```json\s*(.*?)\s*```', generated_text, re.DOTALL)
             if json_match:
                 json_str = json_match.group(1)
@@ -1391,28 +1407,24 @@ def get_health_notifications(user_id):
             notifications_data = json.loads(json_str)
             notifications = notifications_data.get('notifications', [])
 
-            # 6. Store in database cache
+            # 15. First delete any existing cache entries for this user
+            NotificationCache.query.filter_by(user_id=user_id).delete()
+
+            # 16. Store in a new cache entry
             # Calculate expiration time (24 hours later)
             invalidate_time = datetime.utcnow() + timedelta(hours=24)
 
-            # Check if we have an existing cache entry
-            existing_cache = NotificationCache.query.filter_by(cache_key=cache_key).first()
+            # Create a simpler cache key using just user_id and date
+            cache_key = hashlib.md5(f"{user_id}:{datetime.now().strftime('%Y-%m-%d')}".encode()).hexdigest()
 
-            if existing_cache:
-                # Update existing cache entry
-                existing_cache.notifications_json = json.dumps(notifications)
-                existing_cache.last_updated = datetime.utcnow()
-                existing_cache.invalidate_after = invalidate_time
-            else:
-                # Create new cache entry
-                new_cache = NotificationCache(
-                    user_id=user_id,
-                    cache_key=cache_key,
-                    notifications_json=json.dumps(notifications),
-                    invalidate_after=invalidate_time
-                )
-                db.session.add(new_cache)
-
+            # Create new cache entry
+            new_cache = NotificationCache(
+                user_id=user_id,
+                cache_key=cache_key,
+                notifications_json=json.dumps(notifications),
+                invalidate_after=invalidate_time
+            )
+            db.session.add(new_cache)
             db.session.commit()
 
             # Return the parsed notifications
@@ -1420,6 +1432,7 @@ def get_health_notifications(user_id):
                 'message': 'Health notifications generated successfully',
                 'notifications': notifications,
                 'cached': False,
+                'data_points_processed': len(all_device_data),  # Add this for debugging
                 'success': True
             }), 200
 
@@ -1437,7 +1450,6 @@ def get_health_notifications(user_id):
     except Exception as e:
         print(f"Error generating health notifications: {traceback.format_exc()}")
         return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
-
 
 # Utility endpoint to manually invalidate the notification cache
 @app.route('/health-notifications/<int:user_id>/invalidate-cache', methods=['POST'])
