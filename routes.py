@@ -78,6 +78,72 @@ def get_current_user():
     elif current_user and current_user.is_authenticated:
         return current_user
     return None
+def get_biomarker_context(patient_id, days_lookback=30):
+    """
+    Fetch recent biomarker data for a patient to be used as context in the chat
+    """
+    if not patient_id:
+        return ""
+    
+    # Calculate date range (last 30 days by default)
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days_lookback)
+    
+    biomarker_context = ""
+    
+    try:
+        # Get all fluid elements
+        elements = InterstitialFluidElement.query.all()
+        
+        for element in elements:
+            # Query recent measurements for this element
+            query = DeviceDataQuery.query.filter_by(
+                user_id=patient_id, 
+                element_id=element.element_id
+            ).filter(
+                DeviceDataQuery.date_logged >= start_date,
+                DeviceDataQuery.date_logged <= end_date
+            ).order_by(DeviceDataQuery.date_logged.desc())
+            
+            measurements = query.all()
+            
+            if measurements:
+                # Calculate statistics
+                values = [m.recorded_value for m in measurements]
+                
+                # Apply scaling for certain biomarkers
+                element_name = element.element_name.lower()
+                if element_name in ['glucose', 'potassium', 'lactate']:
+                    values = [v / 10 for v in values]
+                
+                avg_value = sum(values) / len(values)
+                min_value = min(values)
+                max_value = max(values)
+                
+                # Add to context
+                biomarker_context += f"\n{element.element_name} data (last {days_lookback} days):\n"
+                biomarker_context += f"  - {len(measurements)} measurements\n"
+                biomarker_context += f"  - Average: {avg_value:.1f}\n"
+                biomarker_context += f"  - Range: {min_value:.1f} - {max_value:.1f}\n"
+                
+                # Add range information if available
+                if element.lower_limit and element.upper_limit:
+                    biomarker_context += f"  - Normal range: {float(element.lower_limit):.1f} - {float(element.upper_limit):.1f}\n"
+                
+                # Add status assessment
+                if element.lower_limit and element.upper_limit:
+                    if avg_value < float(element.lower_limit):
+                        biomarker_context += f"  - Status: Below normal range\n"
+                    elif avg_value > float(element.upper_limit):
+                        biomarker_context += f"  - Status: Above normal range\n"
+                    else:
+                        biomarker_context += f"  - Status: Within normal range\n"
+        
+        return biomarker_context
+    
+    except Exception as e:
+        print(f"Error fetching biomarker context: {e}")
+        return ""
 
 
 @app.route('/', methods=['GET'])
@@ -854,7 +920,12 @@ def chat_ai(user_id, chat_id):
 
     # Combine the health context with the user's prompt
     profile_prompt = health_context + prompt
-
+    biomarker_context = ""
+    if user and profile:
+        biomarker_context = get_biomarker_context(profile.patient_id)
+    
+    # Combine all context with the user's prompt
+    enhanced_prompt = health_context + biomarker_context + prompt
     # Set the region and model details
     region = "us-east-1"
     model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
@@ -1480,3 +1551,173 @@ def invalidate_notification_cache(user_id):
 
     except Exception as e:
         return jsonify({'message': f'Error invalidating cache: {str(e)}', 'success': False}), 500
+    
+
+@app.route('/biomarker-correlation/<int:user_id>/<int:chat_id>', methods=['POST'])
+@token_required
+def biomarker_correlation(user_id, chat_id):
+    """
+    Endpoint to analyze correlations between multiple biomarkers
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({'message': 'Authentication required', 'success': False}), 401
+    
+    data = request.get_json()
+    if not data or 'biomarkers' not in data or not data['biomarkers']:
+        return jsonify({'message': 'Biomarker data is required', 'success': False}), 400
+        
+    biomarkers = data['biomarkers']
+    user_prompt = data.get('prompt', 'Analyze the correlation between these biomarkers.')
+    
+    # Get or create chat
+    chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
+    first_message = False
+    
+    if not chat:
+        # Create new chat
+        suggested_title = "Biomarker Correlation Analysis"
+        if len(biomarkers) == 1:
+            suggested_title = f"{biomarkers[0]['elementName']} Analysis"
+        elif len(biomarkers) == 2:
+            suggested_title = f"{biomarkers[0]['elementName']} & {biomarkers[1]['elementName']} Correlation"
+            
+        chat = ChatManager(user_id=user_id, chat_id=chat_id, title=suggested_title)
+        db.session.add(chat)
+        db.session.commit()
+        first_message = True
+    else:
+        # Check if this is the first message
+        first_message = not Message.query.filter_by(chat_id=chat.id).first()
+    
+    # Generate a comprehensive prompt for analyzing biomarker correlations
+    enhanced_prompt = f"""
+You are analyzing {len(biomarkers)} biomarkers for a patient. Here is the detailed information:
+
+"""
+    
+    # Add information about each biomarker
+    for i, biomarker in enumerate(biomarkers):
+        enhanced_prompt += f"""
+BIOMARKER {i+1}: {biomarker.get('elementName', 'Unknown')}
+- Time Frame: {biomarker.get('timeFrame', 'Unknown')}
+- Total Measurements: {biomarker.get('totalMeasurements', 'Unknown')}
+"""
+
+        # Add statistics if available
+        if 'statistics' in biomarker:
+            stats = biomarker['statistics']
+            enhanced_prompt += f"""
+- Statistics:
+  * Average: {stats.get('average', 'Unknown')}
+  * Minimum: {stats.get('minimum', {}).get('value', 'Unknown')} on {stats.get('minimum', {}).get('date', 'Unknown')}
+  * Maximum: {stats.get('maximum', {}).get('value', 'Unknown')} on {stats.get('maximum', {}).get('date', 'Unknown')}
+"""
+
+        # Add normal range if available
+        if 'normalRange' in biomarker:
+            nr = biomarker['normalRange']
+            enhanced_prompt += f"""
+- Normal Range:
+  * Lower limit: {nr.get('lower', 'Not specified')}
+  * Upper limit: {nr.get('upper', 'Not specified')}
+"""
+
+    # Add correlation analysis instructions
+    if len(biomarkers) > 1:
+        enhanced_prompt += """
+Please analyze any potential correlations between these biomarkers, considering:
+1. How these biomarkers typically interact in the body
+2. Whether there are any notable patterns between the values
+3. What medical significance these correlations might have
+4. Any lifestyle or dietary factors that might affect these biomarkers together
+"""
+    else:
+        enhanced_prompt += """
+Please analyze this biomarker in depth, considering:
+1. What this biomarker indicates about health
+2. Whether the values are within normal ranges
+3. What factors might affect this biomarker
+4. Any lifestyle or dietary recommendations based on these values
+"""
+    
+    # Add the user's specific question if provided
+    enhanced_prompt += f"\n\nThe patient is asking: \"{user_prompt}\"\n"
+    
+    # Set up AWS Bedrock
+    if (os.environ.get("AWS_PROFILE") is None):
+        session = boto3.Session(
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            region_name='us-east-1'
+        )
+    else:
+        session = boto3.Session(
+            profile_name=os.environ.get("AWS_PROFILE")
+        )
+    
+    # Use the bedrock-agent-runtime client
+    bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
+    model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    region = "us-east-1"
+    model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
+    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
+    
+    if not knowledge_base_id:
+        return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
+    
+    try:
+        # Call Claude with the enhanced prompt
+        response = bedrock_agent_client.retrieve_and_generate(
+            input={'text': enhanced_prompt},
+            retrieveAndGenerateConfiguration={
+                'type': 'KNOWLEDGE_BASE',
+                'knowledgeBaseConfiguration': {
+                    'knowledgeBaseId': knowledge_base_id,
+                    'modelArn': model_arn
+                }
+            }
+        )
+        
+        # Parse Claude's response
+        generated_text = None
+        
+        if "output" in response and "text" in response["output"]:
+            generated_text = response["output"]["text"]
+        elif "content" in response and isinstance(response["content"], list):
+            text_blocks = [block["text"] for block in response["content"]
+                          if block.get("type") == "text" and "text" in block]
+            generated_text = "\n".join(text_blocks)
+        
+        if not generated_text:
+            return jsonify({
+                'message': 'Unable to parse Claude response',
+                'raw_response': response,
+                'success': False
+            }), 200
+        
+        # Store messages
+        storeMessage(user_id, chat_id, "user", user_prompt)
+        storeMessage(user_id, chat_id, "assistant", generated_text)
+        
+        # Generate a title if this is the first message
+        if first_message:
+            if len(biomarkers) == 1:
+                title = f"{biomarkers[0]['elementName']} Analysis"
+            elif len(biomarkers) == 2:
+                title = f"{biomarkers[0]['elementName']} & {biomarkers[1]['elementName']} Correlation"
+            else:
+                title = "Multi-Biomarker Analysis"
+                
+            chat.title = title
+            db.session.commit()
+        
+        return jsonify({
+            'message': 'Analysis successful',
+            'generated_text': generated_text,
+            'title': chat.title,
+            'success': True
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
