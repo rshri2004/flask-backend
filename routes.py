@@ -1374,7 +1374,7 @@ def get_health_notifications(user_id):
 
         # Convert to JSON string
         health_context_json = json.dumps(health_context, indent=2)
-        print(biomarker_stats)
+        #print(biomarker_stats)
 
         # 10. Create the prompt for Claude
         prompt = f"""
