@@ -1226,217 +1226,222 @@ def get_health_notifications(user_id):
     # Check for force refresh parameter
     force_refresh = request.args.get('refresh', 'false').lower() == 'true'
 
-    try:
-        # First, clean up any old cache entries for this user
-        if not force_refresh:
-            stale_entries = NotificationCache.query.filter(
-                NotificationCache.user_id == user_id,
-                NotificationCache.invalidate_after < datetime.utcnow()
-            ).all()
+    #try:
+    # First, clean up any old cache entries for this user
+    if not force_refresh:
+        stale_entries = NotificationCache.query.filter(
+            NotificationCache.user_id == user_id,
+            NotificationCache.invalidate_after < datetime.utcnow()
+        ).all()
 
-            for entry in stale_entries:
-                db.session.delete(entry)
+        for entry in stale_entries:
+            db.session.delete(entry)
 
-            db.session.commit()
+        db.session.commit()
 
-            # Now check for any valid cache entry for this user
-            valid_cache = NotificationCache.query.filter(
-                NotificationCache.user_id == user_id,
-                NotificationCache.invalidate_after >= datetime.utcnow()
-            ).first()
+        # Now check for any valid cache entry for this user
+        valid_cache = NotificationCache.query.filter(
+            NotificationCache.user_id == user_id,
+            NotificationCache.invalidate_after >= datetime.utcnow()
+        ).first()
 
-            if valid_cache:
-                # Valid cache entry found in database
-                notifications = json.loads(valid_cache.notifications_json)
+        if valid_cache:
+            # Valid cache entry found in database
+            notifications = json.loads(valid_cache.notifications_json)
 
-                return jsonify({
-                    'message': 'Health notifications retrieved from cache',
-                    'notifications': notifications,
-                    'cached': True,
-                    'cache_updated': valid_cache.last_updated.strftime('%Y-%m-%d %H:%M:%S'),
-                    'success': True
-                }), 200
+            return jsonify({
+                'message': 'Health notifications retrieved from cache',
+                'notifications': notifications,
+                'cached': True,
+                'cache_updated': valid_cache.last_updated.strftime('%Y-%m-%d %H:%M:%S'),
+                'success': True
+            }), 200
 
-        # If we reach here, there's no valid cache or force refresh was requested
-        # 1. Fetch user profile data
-        profile = UserPersonalData.query.filter_by(user_account_id=user_id).first()
-        if not profile:
-            return jsonify({'message': 'User profile not found', 'success': False}), 404
+    # If we reach here, there's no valid cache or force refresh was requested
+    # 1. Fetch user profile data
+    profile = UserPersonalData.query.filter_by(user_account_id=user_id).first()
+    if not profile:
+        return jsonify({'message': 'User profile not found', 'success': False}), 404
 
-        # 2. Fetch user conditions and medications
-        conditions = [condition.condition_name for condition in profile.conditions]
-        medications = [medication.medication_name for medication in profile.medications]
+    # 2. Fetch user conditions and medications
+    conditions = [condition.condition_name for condition in profile.conditions]
+    medications = [medication.medication_name for medication in profile.medications]
 
-        # 3. Define time periods for analysis
-        today = datetime.now().date()
-        time_frames = {
-            "today": (today, today),
-            "past_week": (today - timedelta(days=7), today),
-            "past_month": (today - timedelta(days=30), today),
-            "past_three_months": (today - timedelta(days=90), today),
-            "past_six_months": (today - timedelta(days=180), today),
-            "past_year": (today - timedelta(days=365), today)
+    # 3. Define time periods for analysis
+    today = datetime.now().date()
+    time_frames = {
+        "today": (today, today),
+        "past_week": (today - timedelta(days=7), today),
+        "past_month": (today - timedelta(days=30), today),
+        "past_three_months": (today - timedelta(days=90), today),
+        "past_six_months": (today - timedelta(days=180), today),
+        "past_year": (today - timedelta(days=365), today)
+    }
+
+    # Get earliest date needed (1 year ago) for a single query
+    earliest_date = today - timedelta(days=365)
+
+    # 4. Get all biomarker elements
+    elements = InterstitialFluidElement.query.all()
+    element_map = {element.element_id: element.element_name for element in elements}
+
+    # 5. Make a SINGLE API call to fetch ALL device data for the past year
+    all_device_data = DeviceDataQuery.query.filter_by(user_id=profile.patient_id).filter(
+        DeviceDataQuery.date_logged >= earliest_date
+    ).order_by(DeviceDataQuery.date_logged, DeviceDataQuery.time_stamp).all()
+
+    # 6. Process the data into time frames after fetching it once
+    biomarker_data = {}
+
+    # Initialize all time frames and biomarkers with empty lists
+    for period_name in time_frames.keys():
+        biomarker_data[period_name] = {}
+        for element_id, element_name in element_map.items():
+            biomarker_data[period_name][element_name] = []
+
+
+    # Populate data for each time frame from the single dataset
+    for data_point in all_device_data:
+        data_date = data_point.date_logged
+        element_name = element_map.get(data_point.element_id)
+
+        if not element_name:
+            continue  # Skip if element not found in map
+
+        # Create a data point object
+        point_data = {
+            "date": data_date.strftime('%Y-%m-%d'),
+            "time": data_point.time_stamp.strftime('%H:%M:%S'),
+            "value": data_point.recorded_value
         }
 
-        # Get earliest date needed (1 year ago) for a single query
-        earliest_date = today - timedelta(days=365)
+        # Add to all applicable time frames
+        for period_name, (start_date, end_date) in time_frames.items():
+            if start_date <= data_date <= end_date:
+                if element_name not in biomarker_data[period_name]:
+                    biomarker_data[period_name][element_name] = []
 
-        # 4. Get all biomarker elements
-        elements = InterstitialFluidElement.query.all()
-        element_map = {element.element_id: element.element_name for element in elements}
+                biomarker_data[period_name][element_name].append(point_data)
 
-        # 5. Make a SINGLE API call to fetch ALL device data for the past year
-        all_device_data = DeviceDataQuery.query.filter_by(user_id=profile.patient_id).filter(
-            DeviceDataQuery.date_logged >= earliest_date
-        ).order_by(DeviceDataQuery.date_logged, DeviceDataQuery.time_stamp).all()
+    # 7. Calculate statistics for each biomarker and time frame
+    biomarker_stats = {}
+    for period_name, period_data in biomarker_data.items():
+        biomarker_stats[period_name] = {}
+        for element_name, readings in period_data.items():
+            # Only calculate stats if we have readings
+            if readings:
+                values = [reading["value"] for reading in readings]
+                biomarker_stats[period_name][element_name] = {
+                    "count": len(values),
+                    "min": min(values),
+                    "max": max(values),
+                    "avg": sum(values) / len(values),
+                    "first": values[0] if values else None,
+                    "last": values[-1] if values else None,
+                    # Calculate trend (positive = increasing, negative = decreasing)
+                    "trend": values[-1] - values[0] if len(values) > 1 else 0
+                }
 
-        # 6. Process the data into time frames after fetching it once
-        biomarker_data = {}
-
-        # Initialize all time frames and biomarkers with empty lists
-        for period_name in time_frames.keys():
-            biomarker_data[period_name] = {}
-            for element_id, element_name in element_map.items():
-                biomarker_data[period_name][element_name] = []
-
-
-        # Populate data for each time frame from the single dataset
-        for data_point in all_device_data:
-            data_date = data_point.date_logged
-            element_name = element_map.get(data_point.element_id)
-
-            if not element_name:
-                continue  # Skip if element not found in map
-
-            # Create a data point object
-            point_data = {
-                "date": data_date.strftime('%Y-%m-%d'),
-                "time": data_point.time_stamp.strftime('%H:%M:%S'),
-                "value": data_point.recorded_value
-            }
-
-            # Add to all applicable time frames
-            for period_name, (start_date, end_date) in time_frames.items():
-                if start_date <= data_date <= end_date:
-                    if element_name not in biomarker_data[period_name]:
-                        biomarker_data[period_name][element_name] = []
-
-                    biomarker_data[period_name][element_name].append(point_data)
-
-        # 7. Calculate statistics for each biomarker and time frame
-        biomarker_stats = {}
-        for period_name, period_data in biomarker_data.items():
-            biomarker_stats[period_name] = {}
-            for element_name, readings in period_data.items():
-                # Only calculate stats if we have readings
-                if readings:
-                    values = [reading["value"] for reading in readings]
-                    biomarker_stats[period_name][element_name] = {
-                        "count": len(values),
-                        "min": min(values),
-                        "max": max(values),
-                        "avg": sum(values) / len(values),
-                        "first": values[0] if values else None,
-                        "last": values[-1] if values else None,
-                        # Calculate trend (positive = increasing, negative = decreasing)
-                        "trend": values[-1] - values[0] if len(values) > 1 else 0
-                    }
-
-        # 8. Get reference ranges for each biomarker
-        element_reference_ranges = {}
-        for element in elements:
-            element_reference_ranges[element.element_name] = {
-                "lower_limit": float(element.lower_limit) if element.lower_limit else None,
-                "upper_limit": float(element.upper_limit) if element.upper_limit else None,
-                "lower_critical_limit": float(element.lower_critical_limit) if element.lower_critical_limit else None,
-                "upper_critical_limit": float(element.upper_critical_limit) if element.upper_critical_limit else None
-            }
-
-        # 9. Build the context for the AWS RAG query
-        health_context = {
-            "profile": {
-                "age": profile.age,
-                "gender": profile.gender,
-                "bmi": float(profile.bmi) if profile.bmi else None,
-                "weight_kg": profile.weight_kg,
-                "height_cm": profile.height_cm,
-                "blood_pressure": profile.blood_pressure,
-                "conditions": conditions,
-                "medications": medications,
-                "is_smoker": profile.is_smoker,
-                "diet_type_id": profile.diet_type_id,
-                "physical_activity_level_id": profile.physical_activity_level_id,
-                "alcohol_consumption_id": profile.alcohol_consumption_id
-            },
-            "biomarker_stats": biomarker_stats,
-            "reference_ranges": element_reference_ranges
+    # 8. Get reference ranges for each biomarker
+    element_reference_ranges = {}
+    for element in elements:
+        element_reference_ranges[element.element_name] = {
+            "lower_limit": float(element.lower_limit) if element.lower_limit else None,
+            "upper_limit": float(element.upper_limit) if element.upper_limit else None,
+            "lower_critical_limit": float(element.lower_critical_limit) if element.lower_critical_limit else None,
+            "upper_critical_limit": float(element.upper_critical_limit) if element.upper_critical_limit else None
         }
 
-        # Convert to JSON string
-        health_context_json = json.dumps(health_context, indent=2)
-        #print(biomarker_stats)
+    # 9. Build the context for the AWS RAG query
+    health_context = {
+        "profile": {
+            "age": profile.age,
+            "gender": profile.gender,
+            "bmi": float(profile.bmi) if profile.bmi else None,
+            "weight_kg": profile.weight_kg,
+            "height_cm": profile.height_cm,
+            "blood_pressure": profile.blood_pressure,
+            "conditions": conditions,
+            "medications": medications,
+            "is_smoker": profile.is_smoker,
+            "diet_type_id": profile.diet_type_id,
+            "physical_activity_level_id": profile.physical_activity_level_id,
+            "alcohol_consumption_id": profile.alcohol_consumption_id
+        },
+        "biomarker_stats": biomarker_stats,
+        "reference_ranges": element_reference_ranges
+    }
 
-        # 10. Create the prompt for Claude
-        prompt = f"""
-        Based on the following patient health data, generate a list of ACTIONABLE health notifications that should be shown to the patient in their home feed.
+    # Convert to JSON string
+    health_context_json = json.dumps(health_context, indent=2)
+    #print(biomarker_stats)
 
-        Patient health data:
-        {health_context_json}
+    # 10. Create the prompt for Claude
+    prompt = f"""
+    Based on the following patient health data, generate a list of ACTIONABLE health notifications that should be shown to the patient in their home feed.
 
-        For each notification:
-        1. Focus on significant findings, concerning trends, or positive improvements
-        2. Prioritize notifications (Critical, Warning, Informational, Positive)
-        3. Make suggestions specific and actionable
-        4. Reference specific biomarkers and their values/trends
-        5. Put the information in context of the patient's conditions and risk factors
-        6. Explain in simple terms why this notification matters to their health
-        7. Use a supportive, non-alarming tone even for critical notifications
-        8. Specify which time range was used for the recommendation (today, past_week, past_month, past_three_months, past_six_months, past_year)
+    Patient health data:
+    {health_context_json}
 
-        Return the results in the following JSON format:
+    For each notification:
+    1. Focus on significant findings, concerning trends, or positive improvements
+    2. Prioritize notifications (Critical, Warning, Informational, Positive)
+    3. Make suggestions specific and actionable
+    4. Reference specific biomarkers and their values/trends
+    5. Put the information in context of the patient's conditions and risk factors
+    6. Explain in simple terms why this notification matters to their health
+    7. Use a supportive, non-alarming tone even for critical notifications
+    8. Specify which time range was used for the recommendation (today, past_week, past_month, past_three_months, past_six_months, past_year)
+
+    Return the results in the following JSON format:
+    {{
+        "notifications": [
         {{
-          "notifications": [
-            {{
-              "id": 1,
-              "priority": "Critical|Warning|Informational|Positive",
-              "title": "Brief clear description",
-              "message": "Detailed explanation and recommendation",
-              "related_biomarkers": ["biomarker1", "biomarker2"],
-              "time_range": "time period used for this insight (today, past_week, past_month, etc.)",
-              "recommendation": "Specific action the user should take"
-            }}
-          ]
+            "id": 1,
+            "priority": "Critical|Warning|Informational|Positive",
+            "title": "Brief clear description",
+            "message": "Detailed explanation and recommendation",
+            "related_biomarkers": ["biomarker1", "biomarker2"],
+            "time_range": "time period used for this insight (today, past_week, past_month, etc.)",
+            "recommendation": "Specific action the user should take"
         }}
+        ]
+    }}
 
-        Return at most 5 notifications, prioritizing the most significant findings.
-        """
+    Return at most 5 notifications, prioritizing the most significant findings.
+    
+    If you don't find relevant information in the knowledge base, please use your general knowledge to provide a helpful response.
+    Always prioritize scientific accuracy and health best practices.
+    """
 
-        # 11. Setup AWS session
-        if (os.environ.get("AWS_PROFILE") is None):
-            session = boto3.Session(
-                aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-                region_name='us-east-1'
-            )
-        else:
-            session = boto3.Session(
-                profile_name=os.environ.get("AWS_PROFILE")
-            )
+    # 11. Setup AWS session
+    if (os.environ.get("AWS_PROFILE") is None):
+        session = boto3.Session(
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            region_name='us-east-1'
+        )
+    else:
+        session = boto3.Session(
+            profile_name=os.environ.get("AWS_PROFILE")
+        )
 
-        # Use the bedrock-agent-runtime client
-        bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
+    # Use the bedrock-agent-runtime client
+    bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
+    bedrock_runtime = session.client(service_name='bedrock-runtime')
 
-        # Get the knowledge base ID from environment
-        knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
-        if not knowledge_base_id:
-            return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
+    # Get the knowledge base ID from environment
+    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
+    if not knowledge_base_id:
+        return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
 
-        # Set the model details
-        region = "us-east-1"
-        model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
-        model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
+    # Set the model details
+    region = "us-east-1"
+    model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
+    model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
 
-        # 12. Call AWS Bedrock RAG
+    # 12. First try with RAG / Knowledge Base
+    try:
         response = bedrock_agent_client.retrieve_and_generate(
             input={'text': prompt},
             retrieveAndGenerateConfiguration={
@@ -1447,23 +1452,66 @@ def get_health_notifications(user_id):
                 }
             }
         )
-
-        # 13. Parse the response
+        
+        # Parse the response to check for fallback condition
         generated_text = None
         if "output" in response and "text" in response["output"]:
             generated_text = response["output"]["text"]
         elif "content" in response and isinstance(response["content"], list):
             text_blocks = [block["text"] for block in response["content"]
-                           if block.get("type") == "text" and "text" in block]
+                            if block.get("type") == "text" and "text" in block]
             generated_text = "\n".join(text_blocks)
+        
+        # Check if the response contains the "unable to assist" message
+        unable_to_assist_phrases = [
+            "sorry, i am unable to assist",
+            "i'm unable to assist",
+            "unable to assist you with this request",
+            "i cannot assist with that",
+            "i can't help with that"
+        ]
+        
+        fallback_needed = False
+        if generated_text:
+            lower_text = generated_text.lower()
+            for phrase in unable_to_assist_phrases:
+                if phrase in lower_text:
+                    print(f"Knowledge base returned unable to assist message. Falling back to direct Claude.")
+                    fallback_needed = True
+                    break
+        
+        # If response indicates Claude couldn't help, try direct Claude API
+        if fallback_needed:
+            # Fall back to direct Claude API
+            claude_request = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 4000,
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": prompt
+                    }
+                ]
+            }
+            
+            direct_response = bedrock_runtime.invoke_model(
+                modelId=model_id,
+                body=json.dumps(claude_request)
+            )
+            
+            direct_response_body = json.loads(direct_response['body'].read().decode('utf-8'))
+            
+            if "content" in direct_response_body and len(direct_response_body["content"]) > 0:
+                generated_text = direct_response_body["content"][0]["text"]
+            else:
+                return jsonify({
+                    'message': 'Both knowledge base and direct Claude failed to generate a response',
+                    'success': False
+                }), 500
+        
+        # Continue with the existing code to process generated_text
 
-        if not generated_text:
-            return jsonify({
-                'message': 'Unable to parse Claude response',
-                'success': False
-            }), 500
-
-        # 14. Extract JSON from the response
+        # 13. Extract JSON from the response
         try:
             # Extract JSON part from the response (it might contain markdown or explanations)
             import re
@@ -1478,10 +1526,10 @@ def get_health_notifications(user_id):
             notifications_data = json.loads(json_str)
             notifications = notifications_data.get('notifications', [])
 
-            # 15. First delete any existing cache entries for this user
+            # 14. First delete any existing cache entries for this user
             NotificationCache.query.filter_by(user_id=user_id).delete()
 
-            # 16. Store in a new cache entry
+            # 15. Store in a new cache entry
             # Calculate expiration time (24 hours later)
             invalidate_time = datetime.utcnow() + timedelta(hours=24)
 
