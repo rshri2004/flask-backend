@@ -871,75 +871,77 @@ def chat_ai(user_id, chat_id):
     if not data or 'prompt' not in data:
         return jsonify({'message': 'Missing prompt', 'success': False}), 400
 
-    #prompt to user_prompt
+    # Get and validate the user prompt
     prompt = data['prompt'].strip()
     if not prompt:
         return jsonify({'message': 'Prompt is empty', 'success': False}), 400
 
-    ##This is where we get the user data into the chatbot
-    #Retrieve current user using JWT token
+    # Retrieve current user using JWT token
     user = get_current_user()
     health_context = ""
+    profile = None
 
     if user:
-    # Retrieve health profile for the user
+        # Retrieve health profile for the user
         profile = UserPersonalData.query.filter_by(user_account_id=user.account_id).first()
-
         if profile:
-            # Build a context string with the key health metrics,
-            # explicitly checking for None so that even falsy numbers are included.
+            # Build a context string with key health metrics (include "unknown" if missing)
             health_context = "Profile Info: "
-
             if profile.age is not None:
                 health_context += f"Age: {profile.age}. "
             else:
                 health_context += "Age: unknown. "
-
             if profile.weight_kg is not None:
                 health_context += f"Weight: {profile.weight_kg} kg. "
             else:
                 health_context += "Weight: unknown. "
-
             if profile.height_cm is not None:
                 health_context += f"Height: {profile.height_cm} cm. "
             else:
                 health_context += "Height: unknown. "
-
             if profile.blood_pressure:
                 health_context += f"Blood Pressure: {profile.blood_pressure}. "
             else:
                 health_context += "Blood Pressure: not provided. "
-
             if profile.bmi is not None:
                 health_context += f"BMI: {profile.bmi}. "
             else:
                 health_context += "BMI: unknown. "
-
-            # End with a newline to separate from the user's question
+            # Separate the profile context from the prompt
             health_context += "\n"
 
-    # Combine the health context with the user's prompt
+    # Combine profile context and the user's question
     profile_prompt = health_context + prompt
+
+    # Get biomarker context if available
     biomarker_context = ""
     if user and profile:
         biomarker_context = get_biomarker_context(profile.patient_id)
-    
-    # Combine all context with the user's prompt
-    enhanced_prompt = health_context + biomarker_context + prompt
-    # Set the region and model details
-    region = "us-east-1"
-    model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
-    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
 
-    if not knowledge_base_id:
-        return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
+    # Updated structured prompt using the context and the user's question
+    enhanced_prompt = f"""
+You are a helpful health assistant trained to explain patient biomarker data and answer health-related questions clearly and accurately.
 
-    # Check if this chat exists for this user
+Here is the patient’s health profile:
+{health_context}
+
+Recent biomarker insights:
+{biomarker_context}
+
+Patient's question:
+{prompt}
+
+Instructions:
+- Use simple and friendly language.
+- Provide a concise answer limited to no more than 100 words.
+- Focus on how these biomarkers might relate to heart disease risk, trends, or general health.
+- Reassure the patient if no critical issues are detected.
+- Avoid speculation; only answer based on the available data above.
+"""
+
+    # Optionally, add previous conversation history if available
     chat = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
-
-    # Track if this is the first message (for title generation)
     first_message = False
-
     if not chat:
         # Create new chat if it doesn't exist
         chat = ChatManager(user_id=user_id, chat_id=chat_id, title="New Chat")
@@ -947,54 +949,55 @@ def chat_ai(user_id, chat_id):
         db.session.commit()
         first_message = True
     else:
-        # Check if there are any messages in this chat
+        # Mark as first message if no messages exist yet
         first_message = not Message.query.filter_by(chat_id=chat.id).first()
 
-    # Get previous messages from this chat
     previous_messages = Message.query.filter_by(chat_id=chat.id).order_by(Message.timestamp).all()
-
-    # context-aware prompt by adding previous conversations
-    enhanced_prompt = profile_prompt
-
-    # Only include history if there are previous messages
     if previous_messages and len(previous_messages) > 0:
-        # Limit to last 5 exchanges to avoid token limits(for user and assistant)
         history_text = []
-        recent_messages = previous_messages[-10:]  # Get last 10 messages
-
+        recent_messages = previous_messages[-10:]  # Limit to last 10 messages
         for msg in recent_messages:
             role = "User" if msg.sender == "user" else "Assistant"
             history_text.append(f"{role}: {msg.content}")
-
-        # Construct enhanced prompt with history context
         if history_text:
             history_string = "\n".join(history_text)
+            # Prepend history to the structured prompt
             enhanced_prompt = f"""
-                Previous conversation:{history_string}
-                New question: {profile_prompt}
-                Please respond to the new question in the context of the previous conversation.
-                """
+Previous conversation:
+{history_string}
 
-    if (os.environ.get("AWS_PROFILE") is None):
+New question:
+{profile_prompt}
+
+Please respond to the new question in the context of the previous conversation.
+{enhanced_prompt}
+"""
+
+    # Set AWS region and model details
+    region = "us-east-1"
+    model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet v1 ID
+    knowledge_base_id = os.environ.get("KNOWLEDGE_BASE_ID")
+    if not knowledge_base_id:
+        return jsonify({'message': 'Knowledge Base ID not set', 'success': False}), 500
+
+    # Setup AWS session
+    if os.environ.get("AWS_PROFILE") is None:
         session = boto3.Session(
             aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            # If short-lived creds:
-            #aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
             region_name='us-east-1'
         )
     else:
-        print("Using profile")
         session = boto3.Session(
             profile_name=os.environ.get("AWS_PROFILE")
         )
 
-    # Use the bedrock-agent-runtime client
+    # Use the Bedrock Agent Runtime client
     bedrock_agent_client = session.client(service_name='bedrock-agent-runtime')
     model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
 
     try:
-        # Use the enhanced prompt that includes conversation history
+        # Call Bedrock with the structured prompt
         response = bedrock_agent_client.retrieve_and_generate(
             input={'text': enhanced_prompt},
             retrieveAndGenerateConfiguration={
@@ -1006,9 +1009,8 @@ def chat_ai(user_id, chat_id):
             }
         )
 
-        # Attempt to parse Claude's response
+        # Parse Claude's response
         generated_text = None
-
         if "output" in response and "text" in response["output"]:
             generated_text = response["output"]["text"]
         elif "content" in response and isinstance(response["content"], list):
@@ -1023,10 +1025,11 @@ def chat_ai(user_id, chat_id):
                 'success': False
             }), 200
 
+        # Store the user's prompt and the assistant's generated text
         storeMessage(user_id, chat_id, "user", prompt)
         storeMessage(user_id, chat_id, "assistant", generated_text)
 
-        # Generate a title if this is the first message
+        # If this is the first message, optionally generate and store a title
         if first_message:
             title = generate_title_with_claude(prompt)
             chat.title = title
@@ -1043,7 +1046,7 @@ def chat_ai(user_id, chat_id):
         return jsonify({'message': f'Bedrock error: {str(e)}', 'success': False}), 500
     except Exception as e:
         return jsonify({'message': f'Error: {str(e)}', 'success': False}), 500
-    
+
 def storeMessage(user_id, chat_id, sender, content):
     # Get the actual ChatManager record to get its ID
     chat_manager = ChatManager.query.filter_by(user_id=user_id, chat_id=chat_id).first()
