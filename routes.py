@@ -144,6 +144,75 @@ def get_biomarker_context(patient_id, days_lookback=30):
     except Exception as e:
         print(f"Error fetching biomarker context: {e}")
         return ""
+@app.route('/test-aws-guardrails', methods=['POST'])
+def test_aws_guardrails():
+    """
+    Test endpoint to call the AWS ApplyGuardrail API.
+    Expects a JSON payload with a "topic" key (e.g., "sodium").
+    This call uses your Medical_Guardrail (ID: uo3wutvcbhz9, Version 2)
+    and evaluates the provided content.
+    """
+    data = request.get_json()
+    if not data or "topic" not in data:
+        return jsonify({'message': 'Missing topic', 'success': False}), 400
+
+    topic = data["topic"].strip()
+    if not topic:
+        return jsonify({'message': 'Topic is empty', 'success': False}), 400
+
+    # For testing, prepare sample content related to the topic.
+    test_text = f"Medical content regarding {topic}. Ensure this content is safe, relevant, and focused on health."
+
+    # Build the payload according to the ApplyGuardrail API schema.
+    payload = {
+        "source": "OUTPUT",   # Use "INPUT" if you wish to validate user input.
+        "content": [
+            {
+                "text": {
+                    "text": test_text
+                }
+            }
+        ]
+    }
+
+    # Set up AWS session
+    if os.environ.get("AWS_PROFILE") is None:
+        session = boto3.Session(
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            region_name="us-east-1"
+        )
+    else:
+        session = boto3.Session(
+            profile_name=os.environ.get("AWS_PROFILE")
+        )
+
+    # Create a client for the Bedrock runtime
+    bedrock_client = session.client(service_name="bedrock-runtime")
+
+    try:
+        response = bedrock_client.apply_guardrail(
+            guardrailIdentifier="uo3wutvcbhz9",  # Your Medical_Guardrail ID
+            guardrailVersion="2",                # Use Version 2
+            source=payload["source"],
+            content=payload["content"]
+        )
+        # Some API responses include a "body" key; if not, use response directly.
+        if "body" in response:
+            result = json.loads(response["body"].read().decode())
+        else:
+            result = response
+        return jsonify({
+            "message": "Guardrail prompt applied successfully",
+            "result": result,
+            "success": True
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "message": f"Error applying guardrail prompt: {str(e)}",
+            "success": False
+        }), 500
+
 
 
 @app.route('/', methods=['GET'])
@@ -159,7 +228,6 @@ def api_home():
             "/api/medications"
         ]
     })
-
 
 # Authentication Routes
 @app.route('/register', methods=['POST'])
